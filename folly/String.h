@@ -26,30 +26,12 @@
 
 #include <folly/Conv.h>
 #include <folly/ExceptionString.h>
-#include <folly/FBString.h>
 #include <folly/Portability.h>
 #include <folly/Range.h>
 #include <folly/ScopeGuard.h>
 #include <folly/Traits.h>
 
-// Compatibility function, to make sure toStdString(s) can be called
-// to convert a std::string or fbstring variable s into type std::string
-// with very little overhead if s was already std::string
 namespace folly {
-
-inline std::string toStdString(const folly::fbstring& s) {
-  return std::string(s.data(), s.size());
-}
-
-inline const std::string& toStdString(const std::string& s) {
-  return s;
-}
-
-// If called with a temporary, the compiler will select this overload instead
-// of the above, so we don't return a (lvalue) reference to a temporary.
-inline std::string&& toStdString(std::string&& s) {
-  return std::move(s);
-}
 
 /**
  * C-Escape a string, making it suitable for representation as a C string
@@ -88,9 +70,11 @@ String cEscape(StringPiece str) {
  *
  * Recognizes the standard C escape sequences:
  *
+ * \code
  * \' \" \? \\ \a \b \f \n \r \t \v
  * \[0-7]+
  * \x[0-9a-fA-F]+
+ * \endcode
  *
  * In strict mode (default), throws std::invalid_argument if it encounters
  * an unrecognized escape sequence.  In non-strict mode, it leaves
@@ -380,11 +364,11 @@ void hexDump(const void* ptr, size_t size, OutIt out);
 std::string hexDump(const void* ptr, size_t size);
 
 /**
- * Return a fbstring containing the description of the given errno value.
+ * Return a string containing the description of the given errno value.
  * Takes care not to overwrite the actual system errno, so calling
  * errnoStr(errno) is valid.
  */
-fbstring errnoStr(int err);
+std::string errnoStr(int err);
 
 /*
  * Split a string into a list of tokens by delimiter.

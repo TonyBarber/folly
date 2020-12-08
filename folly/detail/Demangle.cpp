@@ -23,7 +23,11 @@
 // So we extract the inclusion of `<demangle.h>` which includes `<libiberty.h>`
 // to here, isolating it.
 #if FOLLY_DETAIL_HAVE_DEMANGLE_H
+// Work around an issue with conflicting `basename` definitions in glibc and
+// binutils headers.
+#define HAVE_DECL_BASENAME 1
 #include <demangle.h> // @manual
+#undef HAVE_DECL_BASENAME
 #endif
 
 namespace folly {
@@ -40,6 +44,16 @@ int cplus_demangle_v3_callback_wrapper(
   (void)mangled;
   (void)cbref;
   (void)opaque;
+  return 0;
+#endif
+}
+
+char* cplus_demangle_v3_wrapper(const char* mangled) {
+#if FOLLY_DETAIL_HAVE_DEMANGLE_H
+  auto const options = DMGL_PARAMS | DMGL_ANSI | DMGL_TYPES;
+  return cplus_demangle_v3(mangled, options);
+#else
+  (void)mangled;
   return 0;
 #endif
 }

@@ -23,8 +23,6 @@
 #include <iostream>
 
 using namespace folly;
-using namespace std::literals::chrono_literals;
-using testing::ContainsRegex;
 
 namespace {
 static bool* expectedMessage;
@@ -40,11 +38,9 @@ void handleLoggingError(
 }
 
 class NoCleanUpLogWriter : public AsyncLogWriter {
-  void performIO(std::vector<std::string>*, size_t) override {}
+  void performIO(const std::vector<std::string>&, size_t) override {}
 
-  bool ttyOutput() const override {
-    return false;
-  }
+  bool ttyOutput() const override { return false; }
 };
 } // namespace
 

@@ -22,15 +22,88 @@
 #include <folly/SharedMutex.h>
 #include <folly/SpinLock.h>
 #include <folly/ssl/Init.h>
+#include <folly/ssl/SSLSessionManager.h>
 #include <folly/system/ThreadId.h>
 
 // ---------------------------------------------------------------------
 // SSLContext implementation
 // ---------------------------------------------------------------------
 namespace folly {
+
+namespace {
+
+int getExDataIndex() {
+  static auto index =
+      SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+  return index;
+}
+
+/**
+ * Configure the given SSL context to use the given version.
+ */
+void configureProtocolVersion(SSL_CTX* ctx, SSLContext::SSLVersion version) {
+#if FOLLY_OPENSSL_PREREQ(1, 1, 0)
+  // Disable TLS 1.3 by default, for now, if this version of OpenSSL
+  // supports it. There are some semantic differences (e.g. assumptions
+  // on getSession() returning a resumable session, SSL_CTX_set_ciphersuites,
+  // etc.)
+  //
+  SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+
+  /*
+   * From the OpenSSL docs https://fburl.com/ii9k29qw:
+   * Setting the minimum or maximum version to 0, will enable protocol versions
+   * down to the lowest version, or up to the highest version supported by the
+   * library, respectively.
+   *
+   * We can use that as the default/fallback.
+   */
+  int minVersion = 0;
+  switch (version) {
+    case SSLContext::SSLVersion::TLSv1:
+      minVersion = TLS1_VERSION;
+      break;
+    case SSLContext::SSLVersion::SSLv3:
+      minVersion = SSL3_VERSION;
+      break;
+    case SSLContext::SSLVersion::TLSv1_2:
+      minVersion = TLS1_2_VERSION;
+      break;
+    case SSLContext::SSLVersion::SSLv2:
+    default:
+      // do nothing
+      break;
+  }
+  int setMinProtoResult = SSL_CTX_set_min_proto_version(ctx, minVersion);
+  DCHECK(setMinProtoResult == 1)
+      << sformat("unsupported min TLS protocol version: 0x{:04x}", minVersion);
+#else
+  int opt = 0;
+  switch (version) {
+    case SSLContext::SSLVersion::TLSv1:
+      opt = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
+      break;
+    case SSLContext::SSLVersion::SSLv3:
+      opt = SSL_OP_NO_SSLv2;
+      break;
+    case SSLContext::SSLVersion::TLSv1_2:
+      opt = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 |
+          SSL_OP_NO_TLSv1_1;
+      break;
+    case SSLContext::SSLVersion::SSLv2:
+    default:
+      // do nothing
+      break;
+  }
+  int newOpt = SSL_CTX_set_options(ctx, opt);
+  DCHECK((newOpt & opt) == opt);
+#endif // FOLLY_OPENSSL_PREREQ(1, 1, 0)
+}
+
+} // namespace
+
 //
 // For OpenSSL portability API
-using namespace folly::ssl;
 
 // SSLContext implementation
 SSLContext::SSLContext(SSLVersion version) {
@@ -41,35 +114,8 @@ SSLContext::SSLContext(SSLVersion version) {
     throw std::runtime_error("SSL_CTX_new: " + getErrors());
   }
 
-  int opt = 0;
-  switch (version) {
-    case TLSv1:
-      opt = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
-      break;
-    case SSLv3:
-      opt = SSL_OP_NO_SSLv2;
-      break;
-    case TLSv1_2:
-      opt = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 |
-          SSL_OP_NO_TLSv1_1;
-      break;
-    case SSLv2:
-    default:
-      // do nothing
-      break;
-  }
-
-    // Disable TLS 1.3 by default, for now, if this version of OpenSSL
-    // supports it. There are some semantic differences (e.g. assumptions
-    // on getSession() returning a resumable session, SSL_CTX_set_ciphersuites,
-    // etc.)
-    //
-#if FOLLY_OPENSSL_HAS_TLS13
-  opt |= SSL_OP_NO_TLSv1_3;
-#endif
-
-  int newOpt = SSL_CTX_set_options(ctx_, opt);
-  DCHECK((newOpt & opt) == opt);
+  // configure the TLS version used
+  configureProtocolVersion(ctx_, version);
 
   SSL_CTX_set_mode(ctx_, SSL_MODE_AUTO_RETRY);
 
@@ -78,6 +124,8 @@ SSLContext::SSLContext(SSLVersion version) {
   SSL_CTX_set_options(ctx_, SSL_OP_NO_COMPRESSION);
 
   sslAcceptRunner_ = std::make_unique<SSLAcceptRunner>();
+
+  setupCtx(ctx_);
 
 #if FOLLY_OPENSSL_HAS_SNI
   SSL_CTX_set_tlsext_servername_callback(ctx_, baseServerNameOpenSSLCallback);
@@ -144,6 +192,7 @@ void SSLContext::setServerECCurve(const std::string& curveName) {
 }
 
 SSLContext::SSLContext(SSL_CTX* ctx) : ctx_(ctx) {
+  setupCtx(ctx);
   if (SSL_CTX_up_ref(ctx) == 0) {
     throw std::runtime_error("Failed to increment SSL_CTX refcount");
   }
@@ -165,6 +214,15 @@ void SSLContext::setCiphersOrThrow(const std::string& ciphers) {
     throw std::runtime_error("SSL_CTX_set_cipher_list: " + getErrors());
   }
   providedCiphersString_ = ciphers;
+}
+
+void SSLContext::setSigAlgsOrThrow(const std::string& sigalgs) {
+#if OPENSSL_VERSION_NUMBER >= 0x1000200fL
+  int rc = SSL_CTX_set1_sigalgs_list(ctx_, sigalgs.c_str());
+  if (rc == 0) {
+    throw std::runtime_error("SSL_CTX_set1_sigalgs_list " + getErrors());
+  }
+#endif
 }
 
 void SSLContext::setVerificationOption(
@@ -518,9 +576,9 @@ bool SSLContext::setRandomizedAdvertisedNextProtocols(
   // Note that this function reverses the typical return value convention
   // of openssl and returns 0 on success.
   return SSL_CTX_set_alpn_protos(
-          ctx_,
-          advertisedNextProtocols_[0].protocols,
-          advertisedNextProtocols_[0].length) == 0;
+             ctx_,
+             advertisedNextProtocols_[0].protocols,
+             advertisedNextProtocols_[0].length) == 0;
 }
 
 void SSLContext::deleteNextProtocolsStrings() {
@@ -648,6 +706,69 @@ std::string SSLContext::getErrors(int errnoCopy) {
     errors = "error code: " + folly::to<std::string>(errnoCopy);
   }
   return errors;
+}
+
+void SSLContext::enableTLS13() {
+#if FOLLY_OPENSSL_IS_110
+  SSL_CTX_set_max_proto_version(ctx_, 0);
+#endif
+}
+
+void SSLContext::setupCtx(SSL_CTX* ctx) {
+  // 1) folly::AsyncSSLSocket wants to unconditionally store a client
+  // session, so that is possible to later perform TLS resumption.
+  // For that, we need SSL_SESS_CACHE_CLIENT.
+  //
+  // 2) wangle::SSLSessionCacheManager needs to be able to receive
+  // SSL_SESSIONs that are established through a successful
+  // connection. For that, we need SSL_SESS_CACHE_SERVER. Consequently,
+  // given the requirements of (1), we opt to use SSL_SESS_CACHE_BOTH
+  //
+  // 3) We explicitly disable the OpenSSL internal session cache, as there
+  // is very little we can do to control the memory usage of the internal
+  // session cache. Server side session-id based caching should be explicitly
+  // opted-in by the user, by forcing them to provide an implementation of
+  // a SessionCache interface (e.g. wangle::SSLSessionCacheManager); i.e.,
+  // the user must be cognizant of the fact that doing so would result in
+  // increased memory usage.
+  SSL_CTX_set_session_cache_mode(
+      ctx,
+      SSL_SESS_CACHE_BOTH | SSL_SESS_CACHE_NO_INTERNAL |
+          SSL_SESS_CACHE_NO_AUTO_CLEAR);
+
+  SSL_CTX_set_ex_data(ctx, getExDataIndex(), this);
+  SSL_CTX_sess_set_new_cb(ctx, SSLContext::newSessionCallback);
+}
+
+SSLContext* SSLContext::getFromSSLCtx(const SSL_CTX* ctx) {
+  return static_cast<SSLContext*>(SSL_CTX_get_ex_data(ctx, getExDataIndex()));
+}
+
+int SSLContext::newSessionCallback(SSL* ssl, SSL_SESSION* session) {
+  SSL_CTX* ctx = SSL_get_SSL_CTX(ssl);
+  SSLContext* context = getFromSSLCtx(ctx);
+
+  auto& cb = context->sessionLifecycleCallbacks_;
+  if (cb != nullptr && cb) {
+    SSL_SESSION_up_ref(session);
+    auto sessionPtr = folly::ssl::SSLSessionUniquePtr(session);
+    cb->onNewSession(ssl, std::move(sessionPtr));
+  }
+
+  // Session will either be moved to session manager or
+  // freed when the unique_ptr goes out of scope
+  auto sessionPtr = folly::ssl::SSLSessionUniquePtr(session);
+  auto sessionManager = folly::ssl::SSLSessionManager::getFromSSL(ssl);
+  if (sessionManager) {
+    sessionManager->onNewSession(std::move(sessionPtr));
+  }
+
+  return 1;
+}
+
+void SSLContext::setSessionLifecycleCallbacks(
+    std::unique_ptr<SessionLifecycleCallbacks> cb) {
+  sessionLifecycleCallbacks_ = std::move(cb);
 }
 
 std::ostream& operator<<(std::ostream& os, const PasswordCollector& collector) {

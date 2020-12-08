@@ -16,6 +16,10 @@
 
 #pragma once
 
+#include <folly/Portability.h>
+
+#if FOLLY_HAS_COROUTINES
+
 #include <folly/experimental/coro/AsyncGenerator.h>
 #include <folly/experimental/coro/Task.h>
 
@@ -32,9 +36,7 @@ class AsyncGeneratorWrapper {
   explicit AsyncGeneratorWrapper(coro::AsyncGenerator<T>&& gen)
       : gen_(std::move(gen)) {}
 
-  coro::Task<NextResult<T>> getNext() {
-    co_return co_await gen_.next();
-  }
+  coro::Task<NextResult<T>> getNext() { co_return co_await gen_.next(); }
 
  private:
   coro::AsyncGenerator<T> gen_;
@@ -42,3 +44,5 @@ class AsyncGeneratorWrapper {
 
 } // namespace python
 } // namespace folly
+
+#endif

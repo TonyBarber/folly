@@ -58,7 +58,7 @@ class PasswordCollector {
   /**
    * Return a description of this collector for logging purposes
    */
-  virtual std::string describe() const = 0;
+  virtual const std::string& describe() const = 0;
 };
 
 /**
@@ -84,6 +84,11 @@ class SSLAcceptRunner {
  */
 class SSLContext {
  public:
+  struct SessionLifecycleCallbacks {
+    virtual void onNewSession(SSL*, folly::ssl::SSLSessionUniquePtr) = 0;
+    virtual ~SessionLifecycleCallbacks() = default;
+  };
+
   enum SSLVersion {
     SSLv2,
     SSLv3,
@@ -130,9 +135,7 @@ class SSLContext {
    * Make sure that you only call this when there was no intervening operation
    * since the last OpenSSL error that may have changed the current errno value.
    */
-  static std::string getErrors() {
-    return getErrors(errno);
-  }
+  static std::string getErrors() { return getErrors(errno); }
 
   /**
    * Constructor.
@@ -163,7 +166,6 @@ class SSLContext {
   /**
    * Set default ciphers to be used in SSL handshake process.
    */
-
   template <typename Iterator>
   void setCipherList(Iterator ibegin, Iterator iend) {
     if (ibegin != iend) {
@@ -185,20 +187,18 @@ class SSLContext {
   }
 
   /**
-   * Sets the signature algorithms to be used during SSL negotiation
-   * for TLS1.2+.
+   * Low-level method that attempts to set the provided signature
+   * algorithms on the SSL_CTX object for TLS1.2+,
+   * and throws if something goes wrong.
    */
+  virtual void setSigAlgsOrThrow(const std::string& sigAlgs);
 
   template <typename Iterator>
   void setSignatureAlgorithms(Iterator ibegin, Iterator iend) {
     if (ibegin != iend) {
-#if OPENSSL_VERSION_NUMBER >= 0x1000200fL
       std::string opensslSigAlgsList;
       join(":", ibegin, iend, opensslSigAlgsList);
-      if (!SSL_CTX_set1_sigalgs_list(ctx_, opensslSigAlgsList.c_str())) {
-        throw std::runtime_error("SSL_CTX_set1_sigalgs_list " + getErrors());
-      }
-#endif
+      setSigAlgsOrThrow(opensslSigAlgsList);
     }
   }
 
@@ -503,9 +503,7 @@ class SSLContext {
   /**
    * Gets the underlying SSL_CTX for advanced usage
    */
-  SSL_CTX* getSSLCtx() const {
-    return ctx_;
-  }
+  SSL_CTX* getSSLCtx() const { return ctx_; }
 
   /**
    * Examine OpenSSL's error stack, and return a string description of the
@@ -515,12 +513,8 @@ class SSLContext {
    */
   static std::string getErrors(int errnoCopy);
 
-  bool checkPeerName() {
-    return checkPeerName_;
-  }
-  std::string peerFixedName() {
-    return peerFixedName_;
-  }
+  bool checkPeerName() { return checkPeerName_; }
+  std::string peerFixedName() { return peerFixedName_; }
 
 #if defined(SSL_MODE_HANDSHAKE_CUTTHROUGH)
   /**
@@ -543,14 +537,27 @@ class SSLContext {
     sslAcceptRunner_ = std::move(runner);
   }
 
-  const SSLAcceptRunner* sslAcceptRunner() {
-    return sslAcceptRunner_.get();
-  }
+  const SSLAcceptRunner* sslAcceptRunner() { return sslAcceptRunner_.get(); }
 
   /**
    * Helper to match a hostname versus a pattern.
    */
   static bool matchName(const char* host, const char* pattern, int size);
+
+  /**
+   * Temporary. Will be removed after TLS1.3 is enabled by default.
+   * Function to enable TLS1.3 in OpenSSL versions that support it.
+   * Used to migrate users to TLS1.3 piecemeal.
+   */
+  void enableTLS13();
+
+  /**
+   * Get SSLContext from the ex data of a SSL_CTX.
+   */
+  static SSLContext* getFromSSLCtx(const SSL_CTX* ctx);
+
+  void setSessionLifecycleCallbacks(
+      std::unique_ptr<SessionLifecycleCallbacks> cb);
 
   [[deprecated("Use folly::ssl::init")]] static void initializeOpenSSL();
 
@@ -626,6 +633,13 @@ class SSLContext {
 #endif
 
   std::string providedCiphersString_;
+
+  void setupCtx(SSL_CTX* ctx);
+
+  std::unique_ptr<SessionLifecycleCallbacks> sessionLifecycleCallbacks_{
+      nullptr};
+
+  static int newSessionCallback(SSL* ssl, SSL_SESSION* session);
 };
 
 typedef std::shared_ptr<SSLContext> SSLContextPtr;

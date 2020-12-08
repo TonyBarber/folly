@@ -16,6 +16,7 @@
 
 #include <folly/experimental/exception_tracer/ExceptionTracer.h>
 
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 
@@ -29,6 +30,8 @@
 #include <folly/experimental/exception_tracer/ExceptionAbi.h>
 #include <folly/experimental/exception_tracer/StackTrace.h>
 #include <folly/experimental/symbolizer/Symbolizer.h>
+
+#if FOLLY_HAVE_ELF && FOLLY_HAVE_DWARF
 
 namespace {
 
@@ -65,6 +68,7 @@ void printExceptionInfo(
   }
   out << " (" << info.frames.size()
       << (info.frames.size() == 1 ? " frame" : " frames") << ")\n";
+#if FOLLY_HAVE_ELF && FOLLY_HAVE_DWARF
   try {
     size_t frameCount = info.frames.size();
 
@@ -91,6 +95,7 @@ void printExceptionInfo(
   } catch (...) {
     out << "\n !!! caught unexpected exception\n";
   }
+#endif
 }
 
 namespace {
@@ -200,6 +205,7 @@ std::vector<ExceptionInfo> getCurrentExceptions() {
   return exceptions;
 }
 
+#if FOLLY_USE_LIBSTDCPP
 namespace {
 
 std::terminate_handler origTerminate = abort;
@@ -238,6 +244,9 @@ void installHandlers() {
   };
   static Once once;
 }
+#endif // FOLLY_USE_LIBSTDCPP
 
 } // namespace exception_tracer
 } // namespace folly
+
+#endif // FOLLY_HAVE_ELF && FOLLY_HAVE_DWARF

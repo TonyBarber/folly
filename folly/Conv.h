@@ -158,9 +158,7 @@ class ConversionError : public ConversionErrorBase {
   ConversionError(const char* str, ConversionCode code)
       : ConversionErrorBase(str), code_(code) {}
 
-  ConversionCode errorCode() const {
-    return code_;
-  }
+  ConversionCode errorCode() const { return code_; }
 
  private:
   ConversionCode code_;
@@ -329,7 +327,12 @@ namespace detail {
 
 template <typename IntegerType>
 constexpr unsigned int digitsEnough() {
-  return (unsigned int)(ceil(sizeof(IntegerType) * CHAR_BIT * M_LN2 / M_LN10));
+  // digits10 returns the number of decimal digits that this type can represent,
+  // not the number of characters required for the max value, so we need to add
+  // one. ex: char digits10 returns 2, because 256-999 cannot be represented,
+  // but we need 3.
+  auto const digits10 = std::numeric_limits<IntegerType>::digits10;
+  return static_cast<unsigned int>(digits10) + 1;
 }
 
 inline size_t
@@ -449,7 +452,7 @@ inline uint32_t digits10(uint64_t v) {
  * Copies the ASCII base 10 representation of v into buffer and
  * returns the number of bytes written. Does NOT append a \0. Assumes
  * the buffer points to digits10(v) bytes of valid memory. Note that
- * uint64 needs at most 20 bytes, uint32_t needs at most 10 bytes,
+ * uint64_t needs at most 20 bytes, uint32_t needs at most 10 bytes,
  * uint16_t needs at most 5 bytes, and so on. Measurements suggest
  * that defining a separate overload for 32-bit integers is not
  * worthwhile.

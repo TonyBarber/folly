@@ -17,6 +17,7 @@
 #include <folly/SharedMutex.h>
 
 #include <stdlib.h>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -87,6 +88,7 @@ TEST(SharedMutex, basic) {
   runBasicTest<SharedMutexReadPriority>();
   runBasicTest<SharedMutexWritePriority>();
   runBasicTest<SharedMutexSuppressTSAN>();
+  runBasicTest<SharedMutexTracked>();
 }
 
 template <typename Lock>
@@ -168,6 +170,7 @@ TEST(SharedMutex, basic_holders) {
   runBasicHoldersTest<SharedMutexReadPriority>();
   runBasicHoldersTest<SharedMutexWritePriority>();
   runBasicHoldersTest<SharedMutexSuppressTSAN>();
+  runBasicHoldersTest<SharedMutexTracked>();
 }
 
 template <typename Lock>
@@ -195,6 +198,7 @@ TEST(SharedMutex, many_read_locks_with_tokens) {
   runManyReadLocksTestWithTokens<SharedMutexReadPriority>();
   runManyReadLocksTestWithTokens<SharedMutexWritePriority>();
   runManyReadLocksTestWithTokens<SharedMutexSuppressTSAN>();
+  runManyReadLocksTestWithTokens<SharedMutexTracked>();
 }
 
 template <typename Lock>
@@ -220,6 +224,7 @@ TEST(SharedMutex, many_read_locks_without_tokens) {
   runManyReadLocksTestWithoutTokens<SharedMutexReadPriority>();
   runManyReadLocksTestWithoutTokens<SharedMutexWritePriority>();
   runManyReadLocksTestWithoutTokens<SharedMutexSuppressTSAN>();
+  runManyReadLocksTestWithoutTokens<SharedMutexTracked>();
 }
 
 template <typename Lock>
@@ -250,6 +255,7 @@ TEST(SharedMutex, timeout_in_past) {
   runTimeoutInPastTest<SharedMutexReadPriority>();
   runTimeoutInPastTest<SharedMutexWritePriority>();
   runTimeoutInPastTest<SharedMutexSuppressTSAN>();
+  runTimeoutInPastTest<SharedMutexTracked>();
 }
 
 template <class Func>
@@ -337,6 +343,7 @@ TEST(SharedMutex, failing_try_timeout) {
   runFailingTryTimeoutTest<SharedMutexReadPriority>();
   runFailingTryTimeoutTest<SharedMutexWritePriority>();
   runFailingTryTimeoutTest<SharedMutexSuppressTSAN>();
+  runFailingTryTimeoutTest<SharedMutexTracked>();
 }
 
 template <typename Lock>
@@ -381,6 +388,7 @@ TEST(SharedMutex, basic_upgrade_tests) {
   runBasicUpgradeTest<SharedMutexReadPriority>();
   runBasicUpgradeTest<SharedMutexWritePriority>();
   runBasicUpgradeTest<SharedMutexSuppressTSAN>();
+  runBasicUpgradeTest<SharedMutexTracked>();
 }
 
 TEST(SharedMutex, read_has_prio) {
@@ -503,57 +511,33 @@ struct EnterLocker {
 struct PosixRWLock {
   pthread_rwlock_t lock_;
 
-  PosixRWLock() {
-    pthread_rwlock_init(&lock_, nullptr);
-  }
+  PosixRWLock() { pthread_rwlock_init(&lock_, nullptr); }
 
-  ~PosixRWLock() {
-    pthread_rwlock_destroy(&lock_);
-  }
+  ~PosixRWLock() { pthread_rwlock_destroy(&lock_); }
 
-  void lock() {
-    pthread_rwlock_wrlock(&lock_);
-  }
+  void lock() { pthread_rwlock_wrlock(&lock_); }
 
-  void unlock() {
-    pthread_rwlock_unlock(&lock_);
-  }
+  void unlock() { pthread_rwlock_unlock(&lock_); }
 
-  void lock_shared() {
-    pthread_rwlock_rdlock(&lock_);
-  }
+  void lock_shared() { pthread_rwlock_rdlock(&lock_); }
 
-  void unlock_shared() {
-    pthread_rwlock_unlock(&lock_);
-  }
+  void unlock_shared() { pthread_rwlock_unlock(&lock_); }
 };
 
 struct PosixMutex {
   pthread_mutex_t lock_;
 
-  PosixMutex() {
-    pthread_mutex_init(&lock_, nullptr);
-  }
+  PosixMutex() { pthread_mutex_init(&lock_, nullptr); }
 
-  ~PosixMutex() {
-    pthread_mutex_destroy(&lock_);
-  }
+  ~PosixMutex() { pthread_mutex_destroy(&lock_); }
 
-  void lock() {
-    pthread_mutex_lock(&lock_);
-  }
+  void lock() { pthread_mutex_lock(&lock_); }
 
-  void unlock() {
-    pthread_mutex_unlock(&lock_);
-  }
+  void unlock() { pthread_mutex_unlock(&lock_); }
 
-  void lock_shared() {
-    pthread_mutex_lock(&lock_);
-  }
+  void lock_shared() { pthread_mutex_lock(&lock_); }
 
-  void unlock_shared() {
-    pthread_mutex_unlock(&lock_);
-  }
+  void unlock_shared() { pthread_mutex_unlock(&lock_); }
 };
 
 template <template <typename> class Atom, typename Lock, typename Locker>
@@ -664,8 +648,9 @@ static void runMixed(
   BENCHMARK_SUSPEND {
     for (size_t t = 0; t < numThreads; ++t) {
       threads[t] = DSched::thread([&, t, numThreads] {
-        struct drand48_data buffer;
-        srand48_r(t, &buffer);
+        std::minstd_rand engine;
+        engine.seed(t);
+
         long writeThreshold = writeFraction * 0x7fffffff;
         Lock privateLock;
         Lock* lock = useSeparateLocks ? &privateLock : &(padded.globalLock);
@@ -674,8 +659,7 @@ static void runMixed(
           this_thread::yield();
         }
         for (size_t op = t; op < numOps; op += numThreads) {
-          long randVal;
-          lrand48_r(&buffer, &randVal);
+          long randVal = engine();
           bool writeOp = randVal < writeThreshold;
           if (writeOp) {
             locker.lock(lock);
@@ -801,8 +785,8 @@ static void runAllAndValidate(size_t numOps, size_t numThreads) {
   BENCHMARK_SUSPEND {
     for (size_t t = 0; t < numThreads; ++t) {
       threads[t] = DSched::thread([&, t, numThreads] {
-        struct drand48_data buffer;
-        srand48_r(t, &buffer);
+        std::minstd_rand engine;
+        engine.seed(t);
 
         bool exclusive = false;
         bool upgrade = false;
@@ -818,8 +802,7 @@ static void runAllAndValidate(size_t numOps, size_t numThreads) {
         }
         for (size_t op = t; op < numOps; op += numThreads) {
           // randVal in [0,1000)
-          long randVal;
-          lrand48_r(&buffer, &randVal);
+          long randVal = engine();
           randVal = (long)((randVal * (uint64_t)1000) / 0x7fffffff);
 
           // make as many assertions as possible about the global state
@@ -1216,15 +1199,14 @@ static void runRemoteUnlock(
         }
         // else we're a sender
 
-        struct drand48_data buffer;
-        srand48_r(t, &buffer);
+        std::minstd_rand engine;
+        engine.seed(t);
 
         while (!goPtr->load()) {
           this_thread::yield();
         }
         for (size_t op = t; op < numOps; op += numSendingThreads) {
-          long unscaledRandVal;
-          lrand48_r(&buffer, &unscaledRandVal);
+          long unscaledRandVal = engine();
 
           // randVal in [0,1]
           double randVal = ((double)unscaledRandVal) / 0x7fffffff;

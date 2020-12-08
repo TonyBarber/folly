@@ -74,7 +74,7 @@ MemoryMapping::MemoryMapping(
     off_t offset,
     off_t length,
     Options options)
-    : file_(std::move(file)), options_(std::move(options)) {
+    : file_(std::move(file)), options_(options) {
   CHECK(file_);
   init(offset, length);
 }
@@ -98,7 +98,7 @@ MemoryMapping::MemoryMapping(
     : MemoryMapping(File(fd), offset, length, options) {}
 
 MemoryMapping::MemoryMapping(AnonymousType, off_t length, Options options)
-    : options_(std::move(options)) {
+    : options_(options) {
   init(0, length);
 }
 
@@ -273,15 +273,11 @@ bool memOpInChunks(
   return true;
 }
 
-/**
- * mlock2 is Linux-only and exists since Linux 4.4
- * On Linux pre-4.4 and other platforms fail with ENOSYS.
- * glibc added the mlock2 wrapper in 2.27
- * https://lists.gnu.org/archive/html/info-gnu/2018-02/msg00000.html
- */
+} // namespace
+
 int mlock2wrapper(
-    const void* addr,
-    size_t len,
+    FOLLY_MAYBE_UNUSED const void* addr,
+    FOLLY_MAYBE_UNUSED size_t len,
     MemoryMapping::LockFlags flags) {
   int intFlags = 0;
   if (flags.lockOnFault) {
@@ -304,8 +300,6 @@ int mlock2wrapper(
   return -1;
 #endif
 }
-
-} // namespace
 
 bool MemoryMapping::mlock(LockMode mode, LockFlags flags) {
   size_t amountSucceeded = 0;

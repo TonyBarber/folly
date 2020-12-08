@@ -18,6 +18,7 @@
 
 #include <folly/Conv.h>
 #include <folly/ExceptionWrapper.h>
+#include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 
 using namespace folly;
@@ -31,12 +32,8 @@ class IntException : public AbstractIntException {
  public:
   explicit IntException(int i) : i_(i), what_(to<std::string>("int == ", i_)) {}
 
-  int getInt() const override {
-    return i_;
-  }
-  const char* what() const noexcept override {
-    return what_.c_str();
-  }
+  int getInt() const override { return i_; }
+  const char* what() const noexcept override { return what_.c_str(); }
 
  private:
   int i_;
@@ -547,6 +544,30 @@ TEST(ExceptionWrapper, base_derived_non_std_exception_test) {
 }
 
 namespace {
+struct ThrownException {};
+struct InSituException : std::exception {
+  InSituException() = default;
+  InSituException(const InSituException&) throw() {}
+};
+struct OnHeapException : std::exception {
+  OnHeapException() = default;
+  OnHeapException(const OnHeapException&) {}
+};
+} // namespace
+
+TEST(ExceptionWrapper, make_wrapper_no_args) {
+  EXPECT_THAT(
+      folly::make_exception_wrapper<ThrownException>().class_name(),
+      testing::Eq(demangle(typeid(ThrownException))));
+  EXPECT_THAT(
+      folly::make_exception_wrapper<InSituException>().class_name(),
+      testing::Eq(demangle(typeid(InSituException))));
+  EXPECT_THAT(
+      folly::make_exception_wrapper<OnHeapException>().class_name(),
+      testing::Eq(demangle(typeid(OnHeapException))));
+}
+
+namespace {
 // Cannot be stored within an exception_wrapper
 struct BigRuntimeError : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -568,7 +589,7 @@ TEST(ExceptionWrapper, handle_std_exception) {
   auto expect_runtime_error_yes_catch_all = [&](const exception_wrapper& ew) {
     ew.handle(
         [](const std::logic_error&) { ADD_FAILURE(); },
-        [&](const std::runtime_error&) { handled = true; },
+        [&](const std::runtime_error&) noexcept { handled = true; },
         [](const std::exception&) { ADD_FAILURE(); },
         [](...) { ADD_FAILURE(); });
   };
@@ -585,7 +606,7 @@ TEST(ExceptionWrapper, handle_std_exception) {
 
   auto expect_runtime_error_no_catch_all = [&](const exception_wrapper& ew) {
     ew.handle(
-        [](const std::logic_error&) { ADD_FAILURE(); },
+        [](const std::logic_error&) noexcept { ADD_FAILURE(); },
         [&](const std::runtime_error&) { handled = true; },
         [](const std::exception&) { ADD_FAILURE(); });
   };

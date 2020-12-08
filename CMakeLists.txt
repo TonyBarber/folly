@@ -38,7 +38,9 @@ set(CMAKE_MODULE_PATH
 
 # package information
 set(PACKAGE_NAME      "folly")
-set(PACKAGE_VERSION   "0.58.0-dev")
+if (NOT DEFINED PACKAGE_VERSION)
+  set(PACKAGE_VERSION   "0.58.0-dev")
+endif()
 set(PACKAGE_STRING    "${PACKAGE_NAME} ${PACKAGE_VERSION}")
 set(PACKAGE_TARNAME   "${PACKAGE_NAME}-${PACKAGE_VERSION}")
 set(PACKAGE_BUGREPORT "https://github.com/facebook/folly/issues")
@@ -70,6 +72,9 @@ set(FOLLY_SUPPORT_SHARED_LIBRARY "${BUILD_SHARED_LIBS}")
 
 include(FBBuildOptions)
 fb_activate_static_library_option()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # Check target architecture
@@ -103,7 +108,7 @@ set(FOLLY_HAVE_PTHREAD "${CMAKE_USE_PTHREADS_INIT}")
 list(APPEND CMAKE_REQUIRED_LIBRARIES Threads::Threads)
 list(APPEND FOLLY_LINK_LIBRARIES Threads::Threads)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+if(MSVC)
   include(FollyCompilerMSVC)
 else()
   include(FollyCompilerUnix)
@@ -115,6 +120,19 @@ include(FollyConfigChecks)
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/CMake/folly-config.h.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/folly/folly-config.h
+)
+
+# Define FOLLY_XLOG_STRIP_PREFIXES when compiling our sources so that
+# folly/logging will automatically choose the correct log category names,
+# using only the relative portion of the source file name inside the
+# folly repository.
+set_property(
+  DIRECTORY
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  APPEND
+  PROPERTY
+  COMPILE_DEFINITIONS
+  "FOLLY_XLOG_STRIP_PREFIXES=\"${CMAKE_SOURCE_DIR}:${CMAKE_BINARY_DIR}\""
 )
 
 # We currently build the main libfolly library by finding all sources
@@ -132,7 +150,6 @@ REMOVE_MATCHES_FROM_LISTS(files hfiles
   MATCHES
     "^${FOLLY_DIR}/build/"
     "^${FOLLY_DIR}/experimental/exception_tracer/"
-    "^${FOLLY_DIR}/experimental/pushmi/"
     "^${FOLLY_DIR}/futures/exercises/"
     "^${FOLLY_DIR}/logging/example/"
     "^${FOLLY_DIR}/(.*/)?test/"
@@ -143,6 +160,7 @@ REMOVE_MATCHES_FROM_LISTS(files hfiles
 list(REMOVE_ITEM files
   ${FOLLY_DIR}/experimental/JSONSchemaTester.cpp
   ${FOLLY_DIR}/experimental/io/HugePageUtil.cpp
+  ${FOLLY_DIR}/python/executor.cpp
   ${FOLLY_DIR}/python/fibers.cpp
   ${FOLLY_DIR}/python/GILAwareManualExecutor.cpp
   ${FOLLY_DIR}/cybld/folly/executor.cpp
@@ -186,15 +204,6 @@ list(APPEND hfiles
 
 # Exclude specific sources if we do not have third-party libraries
 # required to build them.
-if (NOT FOLLY_USE_SYMBOLIZER)
-  REMOVE_MATCHES_FROM_LISTS(files hfiles
-    MATCHES
-      "^${FOLLY_DIR}/experimental/symbolizer/"
-  )
-  list(REMOVE_ITEM files
-    ${FOLLY_DIR}/SingletonStackTrace.cpp
-  )
-endif()
 if (NOT ${LIBAIO_FOUND})
   list(REMOVE_ITEM files
     ${FOLLY_DIR}/experimental/io/AsyncIO.cpp
@@ -217,10 +226,12 @@ if (NOT ${LIBAIO_FOUND} AND NOT ${LIBURING_FOUND})
   list(REMOVE_ITEM files
     ${FOLLY_DIR}/experimental/io/AsyncBase.cpp
     ${FOLLY_DIR}/experimental/io/PollIoBackend.cpp
+    ${FOLLY_DIR}/experimental/io/SimpleAsyncIO.cpp
   )
   list(REMOVE_ITEM hfiles
     ${FOLLY_DIR}/experimental/io/AsyncBase.h
     ${FOLLY_DIR}/experimental/io/PollIoBackend.h
+    ${FOLLY_DIR}/experimental/io/SimpleAsyncIO.h
   )
 endif()
 
@@ -272,6 +283,16 @@ else()
     ${FOLLY_DIR}/experimental/crypto/LtHash.h
   )
 endif()
+if (NOT ${LIBGFLAGS_FOUND})
+  list(REMOVE_ITEM files
+    ${FOLLY_DIR}/experimental/NestedCommandLineApp.cpp
+    ${FOLLY_DIR}/experimental/ProgramOptions.cpp
+  )
+  list(REMOVE_ITEM hfiles
+    ${FOLLY_DIR}/experimental/NestedCommandLineApp.h
+    ${FOLLY_DIR}/experimental/ProgramOptions.h
+  )
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   list(REMOVE_ITEM files
     ${FOLLY_DIR}/Poly.cpp
@@ -315,6 +336,9 @@ add_library(folly_base OBJECT
   ${files} ${hfiles}
   ${CMAKE_CURRENT_BINARY_DIR}/folly/folly-config.h
 )
+if (BUILD_SHARED_LIBS)
+  set_property(TARGET folly_base PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
 auto_source_group(folly ${FOLLY_DIR} ${files} ${hfiles})
 apply_folly_compile_options_to_target(folly_base)
 # Add the generated files to the correct source group.
@@ -355,6 +379,7 @@ option(PYTHON_EXTENSIONS
 add_library(folly
   $<TARGET_OBJECTS:folly_base>
 )
+set_property(TARGET folly PROPERTY VERSION ${PACKAGE_VERSION})
 apply_folly_compile_options_to_target(folly)
 target_compile_features(folly INTERFACE cxx_generic_lambdas)
 
@@ -365,6 +390,7 @@ add_library(folly_test_util
   ${FOLLY_DIR}/test/DeterministicSchedule.cpp
   ${FOLLY_DIR}/test/JsonTestUtil.cpp
 )
+set_property(TARGET folly_test_util PROPERTY VERSION ${PACKAGE_VERSION})
 target_link_libraries(folly_test_util
   PUBLIC
     ${BOOST_LIBRARIES}
@@ -420,10 +446,19 @@ configure_file(
   ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc.gen
   @ONLY
 )
+
+# Specify target to allow resolving generator expressions requiring
+# a target for CMake >=3.19. See #1414.
+# VERSION_GREATER_EQUAL isn't available before CMake 3.7.
+if(NOT CMAKE_VERSION VERSION_LESS 3.19)
+  set(target_arg TARGET folly_deps)
+endif()
+
 file(
   GENERATE
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc
   INPUT ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc.gen
+  ${target_arg}
 )
 install(
   FILES ${CMAKE_CURRENT_BINARY_DIR}/libfolly.pc
@@ -438,6 +473,7 @@ option(BUILD_SLOW_TESTS "If enabled, compile tests that take a while to run in d
 if (BUILD_TESTS)
   option(USE_CMAKE_GOOGLE_TEST_INTEGRATION "If enabled, use the google test integration included in CMake." ON)
   find_package(GMock MODULE REQUIRED)
+  find_package(GTest MODULE REQUIRED)
   if (USE_CMAKE_GOOGLE_TEST_INTEGRATION)
     include(GoogleTest OPTIONAL RESULT_VARIABLE HAVE_CMAKE_GTEST)
     enable_testing()
@@ -483,6 +519,8 @@ if (BUILD_TESTS)
     ${FOLLY_DIR}/io/async/test/ScopedBoundPort.h
     ${FOLLY_DIR}/io/async/test/SocketPair.cpp
     ${FOLLY_DIR}/io/async/test/SocketPair.h
+    ${FOLLY_DIR}/io/async/test/SSLUtil.cpp
+    ${FOLLY_DIR}/io/async/test/SSLUtil.h
     ${FOLLY_DIR}/io/async/test/TestSSLServer.cpp
     ${FOLLY_DIR}/io/async/test/TestSSLServer.h
     ${FOLLY_DIR}/io/async/test/TimeUtil.cpp
@@ -502,6 +540,7 @@ if (BUILD_TESTS)
     SYSTEM
     PUBLIC
       ${LIBGMOCK_INCLUDE_DIR}
+      ${GTEST_INCLUDE_DIRS}
   )
   target_link_libraries(folly_test_support
     PUBLIC
@@ -723,7 +762,7 @@ if (BUILD_TESTS)
       TEST DelayedDestructionTest SOURCES DelayedDestructionTest.cpp
       TEST DelayedDestructionBaseTest SOURCES DelayedDestructionBaseTest.cpp
       TEST DestructorCheckTest SOURCES DestructorCheckTest.cpp
-      TEST EventBaseTest SOURCES EventBaseTest.cpp EventBaseTestLibProvider.cpp
+      TEST EventBaseTest SOURCES EventBaseTest.cpp
       TEST EventBaseLocalTest SOURCES EventBaseLocalTest.cpp
       TEST HHWheelTimerTest SOURCES HHWheelTimerTest.cpp
       TEST HHWheelTimerSlowTests SLOW
@@ -733,8 +772,7 @@ if (BUILD_TESTS)
       TEST ScopedEventBaseThreadTest SOURCES ScopedEventBaseThreadTest.cpp
       TEST ssl_session_test
         CONTENT_DIR certs/
-        SOURCES
-          SSLSessionTest.cpp
+        SOURCES SSLSessionTest.cpp
       TEST writechain_test SOURCES WriteChainAsyncTransportWrapperTest.cpp
 
     DIRECTORY io/async/ssl/test/
@@ -749,9 +787,12 @@ if (BUILD_TESTS)
 
     DIRECTORY memory/test/
       TEST arena_test SOURCES ArenaTest.cpp
+      TEST reentrant_allocator_test SOURCES ReentrantAllocatorTest.cpp
       TEST thread_cached_arena_test WINDOWS_DISABLED
         SOURCES ThreadCachedArenaTest.cpp
       TEST mallctl_helper_test SOURCES MallctlHelperTest.cpp
+      TEST uninitialized_memory_hacks_test
+        SOURCES UninitializedMemoryHacksTest.cpp
 
     DIRECTORY net/detail/test/
       TEST socket_file_descriptor_map_test SOURCES SocketFileDescriptorMapTest.cpp
@@ -807,7 +848,6 @@ if (BUILD_TESTS)
         SOURCES AtomicHashMapTest.cpp
       TEST atomic_linked_list_test SOURCES AtomicLinkedListTest.cpp
       TEST atomic_unordered_map_test SOURCES AtomicUnorderedMapTest.cpp
-      TEST cacheline_padded_test SOURCES CachelinePaddedTest.cpp
       TEST clock_gettime_wrappers_test SOURCES ClockGettimeWrappersTest.cpp
       TEST concurrent_bit_set_test SOURCES ConcurrentBitSetTest.cpp
       TEST concurrent_skip_list_test SOURCES ConcurrentSkipListTest.cpp
@@ -828,8 +868,7 @@ if (BUILD_TESTS)
       TEST file_test SOURCES FileTest.cpp
       # Open-source linux build can't handle running this.
       #TEST file_lock_test SOURCES FileLockTest.cpp
-      TEST file_util_test HANGING
-        SOURCES FileUtilTest.cpp
+      TEST file_util_test SOURCES FileUtilTest.cpp
       TEST fingerprint_test SOURCES FingerprintTest.cpp
       TEST fixed_string_test SOURCES FixedStringTest.cpp
       TEST format_other_test SOURCES FormatOtherTest.cpp
@@ -841,7 +880,6 @@ if (BUILD_TESTS)
       TEST glog_test SOURCES GLogTest.cpp
       TEST group_varint_test SOURCES GroupVarintTest.cpp
       TEST group_varint_test_ssse3 SOURCES GroupVarintTest.cpp
-      TEST has_member_fn_traits_test SOURCES HasMemberFnTraitsTest.cpp
       TEST iterators_test SOURCES IteratorsTest.cpp
       TEST indestructible_test SOURCES IndestructibleTest.cpp
       TEST indexed_mem_pool_test BROKEN
@@ -914,7 +952,7 @@ if (BUILD_TESTS)
   if (${LIBAIO_FOUND})
     folly_define_tests(
       DIRECTORY experimental/io/test/
-        TEST async_io_test SOURCES AsyncIOTest.cpp
+        TEST async_io_test SOURCES AsyncIOTest.cpp AsyncBaseTestLib.cpp IoTestTempFileUtil.cpp
     )
   endif()
 

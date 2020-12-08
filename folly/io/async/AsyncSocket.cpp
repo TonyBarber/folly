@@ -24,6 +24,7 @@
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/IOBufQueue.h>
+#include <folly/io/SocketOptionMap.h>
 #include <folly/portability/Fcntl.h>
 #include <folly/portability/Sockets.h>
 #include <folly/portability/SysUio.h>
@@ -61,15 +62,17 @@ static constexpr bool msgErrQueueSupported =
     false;
 #endif // FOLLY_HAVE_MSG_ERRQUEUE
 
-// static members initializers
-const AsyncSocket::OptionMap AsyncSocket::emptyOptionMap;
+static AsyncSocketException const& getSocketClosedLocallyEx() {
+  static auto& ex = *new AsyncSocketException(
+      AsyncSocketException::END_OF_FILE, "socket closed locally");
+  return ex;
+}
 
-const AsyncSocketException socketClosedLocallyEx(
-    AsyncSocketException::END_OF_FILE,
-    "socket closed locally");
-const AsyncSocketException socketShutdownForWritesEx(
-    AsyncSocketException::END_OF_FILE,
-    "socket shutdown for writes");
+static AsyncSocketException const& getSocketShutdownForWritesEx() {
+  static auto& ex = *new AsyncSocketException(
+      AsyncSocketException::END_OF_FILE, "socket shutdown for writes");
+  return ex;
+}
 
 // TODO: It might help performance to provide a version of BytesWriteRequest
 // that users could derive from, so we can avoid the extra allocation for each
@@ -117,6 +120,9 @@ class AsyncSocket::BytesWriteRequest : public AsyncSocket::WriteRequest {
   }
 
   void destroy() override {
+    if (ioBuf_ && releaseIOBufCallback_) {
+      releaseIOBufCallback_->releaseIOBuf(std::move(ioBuf_));
+    }
     this->~BytesWriteRequest();
     free(this);
   }
@@ -135,37 +141,45 @@ class AsyncSocket::BytesWriteRequest : public AsyncSocket::WriteRequest {
     if (bytesWritten_) {
       if (socket_->isZeroCopyRequest(writeFlags)) {
         if (isComplete()) {
-          socket_->addZeroCopyBuf(std::move(ioBuf_));
+          socket_->addZeroCopyBuf(std::move(ioBuf_), releaseIOBufCallback_);
         } else {
           socket_->addZeroCopyBuf(ioBuf_.get());
         }
       } else {
         // this happens if at least one of the prev requests were sent
         // with zero copy but not the last one
-        if (isComplete() && socket_->getZeroCopy() &&
+        if (isComplete() && zeroCopyRequest_ &&
             socket_->containsZeroCopyBuf(ioBuf_.get())) {
-          socket_->setZeroCopyBuf(std::move(ioBuf_));
+          socket_->setZeroCopyBuf(std::move(ioBuf_), releaseIOBufCallback_);
         }
       }
     }
     return writeResult;
   }
 
-  bool isComplete() override {
-    return opsWritten_ == getOpCount();
-  }
+  bool isComplete() override { return opsWritten_ == getOpCount(); }
 
   void consume() override {
     // Advance opIndex_ forward by opsWritten_
     opIndex_ += opsWritten_;
     assert(opIndex_ < opCount_);
 
-    if (!socket_->isZeroCopyRequest(flags_)) {
+    bool zeroCopyReq = socket_->isZeroCopyRequest(flags_);
+    if (zeroCopyReq) {
+      zeroCopyRequest_ = true;
+    }
+
+    if (!zeroCopyRequest_) {
       // If we've finished writing any IOBufs, release them
+      // but only if we did not send any of them via zerocopy
       if (ioBuf_) {
         for (uint32_t i = opsWritten_; i != 0; --i) {
           assert(ioBuf_);
-          ioBuf_ = ioBuf_->pop();
+          auto next = ioBuf_->pop();
+          if (releaseIOBufCallback_) {
+            releaseIOBufCallback_->releaseIOBuf(std::move(ioBuf_));
+          }
+          ioBuf_ = std::move(next);
         }
       }
     }
@@ -201,6 +215,7 @@ class AsyncSocket::BytesWriteRequest : public AsyncSocket::WriteRequest {
         partialBytes_(partialBytes),
         bytesWritten_(bytesWritten) {
     memcpy(writeOps_, ops, sizeof(*ops) * opCount_);
+    zeroCopyRequest_ = socket_->isZeroCopyRequest(flags_);
   }
 
   // private destructor, to ensure callers use destroy()
@@ -219,6 +234,8 @@ class AsyncSocket::BytesWriteRequest : public AsyncSocket::WriteRequest {
   uint32_t opCount_; ///< number of entries in writeOps_
   uint32_t opIndex_; ///< current index into writeOps_
   WriteFlags flags_; ///< set for WriteFlags
+  bool zeroCopyRequest_{
+      false}; ///< if we sent any part of the ioBuf_ with zerocopy
   unique_ptr<IOBuf> ioBuf_; ///< underlying IOBuf, or nullptr if N/A
 
   // for consume(), how much we wrote on the last write
@@ -341,13 +358,26 @@ AsyncSocket::AsyncSocket(
   state_ = StateEnum::ESTABLISHED;
 }
 
-AsyncSocket::AsyncSocket(AsyncSocket::UniquePtr oldAsyncSocket)
+AsyncSocket::AsyncSocket(AsyncSocket* oldAsyncSocket)
     : AsyncSocket(
           oldAsyncSocket->getEventBase(),
           oldAsyncSocket->detachNetworkSocket(),
           oldAsyncSocket->getZeroCopyBufId()) {
   preReceivedData_ = std::move(oldAsyncSocket->preReceivedData_);
+
+  // inform lifecycle observers to give them an opportunity to unsubscribe from
+  // events for the old socket and subscribe to the new socket; we do not move
+  // the subscription ourselves
+  for (const auto& cb : oldAsyncSocket->lifecycleObservers_) {
+    // only available for observers derived from AsyncSocket::LifecycleObserver
+    if (auto dCb = dynamic_cast<AsyncSocket::LifecycleObserver*>(cb)) {
+      dCb->move(oldAsyncSocket, this);
+    }
+  }
 }
+
+AsyncSocket::AsyncSocket(AsyncSocket::UniquePtr oldAsyncSocket)
+    : AsyncSocket(oldAsyncSocket.get()) {}
 
 // init() method, since constructor forwarding isn't supported in most
 // compilers yet.
@@ -377,6 +407,9 @@ AsyncSocket::~AsyncSocket() {
   VLOG(7) << "actual destruction of AsyncSocket(this=" << this
           << ", evb=" << eventBase_ << ", fd=" << fd_ << ", state=" << state_
           << ")";
+  for (const auto& cb : lifecycleObservers_) {
+    cb->destroy(this);
+  }
 }
 
 void AsyncSocket::destroy() {
@@ -394,6 +427,12 @@ NetworkSocket AsyncSocket::detachNetworkSocket() {
   VLOG(6) << "AsyncSocket::detachFd(this=" << this << ", fd=" << fd_
           << ", evb=" << eventBase_ << ", state=" << state_
           << ", events=" << std::hex << eventFlags_ << ")";
+  for (const auto& cb : lifecycleObservers_) {
+    // only available for observers derived from AsyncSocket::LifecycleObserver
+    if (auto dCb = dynamic_cast<AsyncSocket::LifecycleObserver*>(cb)) {
+      dCb->fdDetach(this);
+    }
+  }
   // Extract the fd, and set fd_ to -1 first, so closeNow() won't
   // actually close the descriptor.
   if (const auto socketSet = wShutdownSocketSet_.lock()) {
@@ -450,7 +489,7 @@ void AsyncSocket::connect(
     ConnectCallback* callback,
     const folly::SocketAddress& address,
     int timeout,
-    const OptionMap& options,
+    const SocketOptionMap& options,
     const folly::SocketAddress& bindAddr) noexcept {
   DestructorGuard dg(this);
   eventBase_->dcheckIsInEventBaseThread();
@@ -529,7 +568,7 @@ void AsyncSocket::connect(
     }
 
     // Apply the additional PRE_BIND options if any.
-    applyOptions(options, OptionKey::ApplyPos::PRE_BIND);
+    applyOptions(options, SocketOptionKey::ApplyPos::PRE_BIND);
 
     VLOG(5) << "AsyncSocket::connect(this=" << this << ", evb=" << eventBase_
             << ", fd=" << fd_ << ", host=" << address.describe().c_str();
@@ -560,7 +599,7 @@ void AsyncSocket::connect(
     }
 
     // Apply the additional POST_BIND options if any.
-    applyOptions(options, OptionKey::ApplyPos::POST_BIND);
+    applyOptions(options, SocketOptionKey::ApplyPos::POST_BIND);
 
     // Call preConnect hook if any.
     if (connectCallback_) {
@@ -655,7 +694,7 @@ void AsyncSocket::connect(
     const string& ip,
     uint16_t port,
     int timeout,
-    const OptionMap& options) noexcept {
+    const SocketOptionMap& options) noexcept {
   DestructorGuard dg(this);
   try {
     connectCallback_ = callback;
@@ -936,7 +975,9 @@ void AsyncSocket::adjustZeroCopyFlags(folly::WriteFlags& flags) {
   }
 }
 
-void AsyncSocket::addZeroCopyBuf(std::unique_ptr<folly::IOBuf>&& buf) {
+void AsyncSocket::addZeroCopyBuf(
+    std::unique_ptr<folly::IOBuf>&& buf,
+    ReleaseIOBufCallback* cb) {
   uint32_t id = getNextZeroCopyBufId();
   folly::IOBuf* ptr = buf.get();
 
@@ -945,6 +986,7 @@ void AsyncSocket::addZeroCopyBuf(std::unique_ptr<folly::IOBuf>&& buf) {
   p.count_++;
   CHECK(p.buf_.get() == nullptr);
   p.buf_ = std::move(buf);
+  p.cb_ = cb;
 }
 
 void AsyncSocket::addZeroCopyBuf(folly::IOBuf* ptr) {
@@ -961,18 +1003,24 @@ void AsyncSocket::releaseZeroCopyBuf(uint32_t id) {
   auto iter1 = idZeroCopyBufInfoMap_.find(ptr);
   CHECK(iter1 != idZeroCopyBufInfoMap_.end());
   if (0 == --iter1->second.count_) {
+    if (iter1->second.cb_) {
+      iter1->second.cb_->releaseIOBuf(std::move(iter1->second.buf_));
+    }
     idZeroCopyBufInfoMap_.erase(iter1);
   }
 
   idZeroCopyBufPtrMap_.erase(iter);
 }
 
-void AsyncSocket::setZeroCopyBuf(std::unique_ptr<folly::IOBuf>&& buf) {
+void AsyncSocket::setZeroCopyBuf(
+    std::unique_ptr<folly::IOBuf>&& buf,
+    ReleaseIOBufCallback* cb) {
   folly::IOBuf* ptr = buf.get();
   auto& p = idZeroCopyBufInfoMap_[ptr];
   CHECK(p.buf_.get() == nullptr);
 
   p.buf_ = std::move(buf);
+  p.cb_ = cb;
 }
 
 bool AsyncSocket::containsZeroCopyBuf(folly::IOBuf* ptr) {
@@ -1046,7 +1094,7 @@ void AsyncSocket::writeChain(
 
   // adjustZeroCopyFlags can set zeroCopyEnabled_ to true
   if (zeroCopyEnabled_ && !isSet(flags, WriteFlags::WRITE_MSG_ZEROCOPY) &&
-      zeroCopyEnableFunc_ && zeroCopyEnableFunc_(buf)) {
+      zeroCopyEnableFunc_ && zeroCopyEnableFunc_(buf) && buf->isManaged()) {
     flags |= WriteFlags::WRITE_MSG_ZEROCOPY;
   }
 
@@ -1091,6 +1139,15 @@ void AsyncSocket::writeImpl(
   unique_ptr<IOBuf> ioBuf(std::move(buf));
   eventBase_->dcheckIsInEventBaseThread();
 
+  auto* releaseIOBufCallback =
+      callback ? callback->getReleaseIOBufCallback() : nullptr;
+
+  SCOPE_EXIT {
+    if (ioBuf && releaseIOBufCallback) {
+      releaseIOBufCallback->releaseIOBuf(std::move(ioBuf));
+    }
+  };
+
   totalAppBytesScheduledForWrite_ += totalBytes;
 
   if (shutdownFlags_ & (SHUT_WRITE | SHUT_WRITE_PENDING)) {
@@ -1133,8 +1190,15 @@ void AsyncSocket::writeImpl(
       } else if (countWritten == count) {
         // done, add the whole buffer
         if (countWritten && isZeroCopyRequest(flags)) {
-          addZeroCopyBuf(std::move(ioBuf));
+          addZeroCopyBuf(std::move(ioBuf), releaseIOBufCallback);
+        } else {
+          if (releaseIOBufCallback) {
+            releaseIOBufCallback->releaseIOBuf(std::move(ioBuf));
+          } else {
+            ioBuf.reset();
+          }
         }
+
         // We successfully wrote everything.
         // Invoke the callback and return.
         if (callback) {
@@ -1316,9 +1380,9 @@ void AsyncSocket::closeNow() {
         doClose();
       }
 
-      invokeConnectErr(socketClosedLocallyEx);
+      invokeConnectErr(getSocketClosedLocallyEx());
 
-      failAllWrites(socketClosedLocallyEx);
+      failAllWrites(getSocketClosedLocallyEx());
 
       if (readCallback_) {
         ReadCallback* callback = readCallback_;
@@ -1426,7 +1490,7 @@ void AsyncSocket::shutdownWriteNow() {
       netops::shutdown(fd_, SHUT_WR);
 
       // Immediately fail all write requests
-      failAllWrites(socketShutdownForWritesEx);
+      failAllWrites(getSocketShutdownForWritesEx());
       return;
     }
     case StateEnum::CONNECTING: {
@@ -1436,7 +1500,7 @@ void AsyncSocket::shutdownWriteNow() {
       shutdownFlags_ |= SHUT_WRITE_PENDING;
 
       // Immediately fail all write requests
-      failAllWrites(socketShutdownForWritesEx);
+      failAllWrites(getSocketShutdownForWritesEx());
       return;
     }
     case StateEnum::UNINIT:
@@ -1451,7 +1515,7 @@ void AsyncSocket::shutdownWriteNow() {
       // the writes, we will never try to call connect, so shut everything down
       shutdownFlags_ |= SHUT_WRITE;
       // Immediately fail all write requests
-      failAllWrites(socketShutdownForWritesEx);
+      failAllWrites(getSocketShutdownForWritesEx());
       return;
     case StateEnum::CLOSED:
     case StateEnum::ERROR:
@@ -1543,6 +1607,9 @@ void AsyncSocket::attachEventBase(EventBase* eventBase) {
   if (evbChangeCb_) {
     evbChangeCb_->evbAttached(this);
   }
+  for (const auto& cb : lifecycleObservers_) {
+    cb->evbAttach(this, eventBase_);
+  }
 }
 
 void AsyncSocket::detachEventBase() {
@@ -1552,6 +1619,10 @@ void AsyncSocket::detachEventBase() {
   assert(eventBase_ != nullptr);
   eventBase_->dcheckIsInEventBaseThread();
 
+  // Make a copy of the existing event base, to invoke lifecycle observer
+  // callbacks
+  EventBase* existingEvb = eventBase_;
+
   eventBase_ = nullptr;
 
   ioHandler_.unregisterHandler();
@@ -1560,6 +1631,9 @@ void AsyncSocket::detachEventBase() {
   writeTimeout_.detachEventBase();
   if (evbChangeCb_) {
     evbChangeCb_->evbDetached(this);
+  }
+  for (const auto& cb : lifecycleObservers_) {
+    cb->evbDetach(this, existingEvb);
   }
 }
 
@@ -1597,19 +1671,14 @@ void AsyncSocket::cachePeerAddress() const {
 }
 
 void AsyncSocket::applyOptions(
-    const OptionMap& options,
-    OptionKey::ApplyPos pos) {
-  for (const auto& opt : options) {
-    if (opt.first.applyPos_ == pos) {
-      auto rv = opt.first.apply(fd_, opt.second);
-      if (rv != 0) {
-        auto errnoCopy = errno;
-        throw AsyncSocketException(
-            AsyncSocketException::INTERNAL_ERROR,
-            withAddr("failed to set socket option"),
-            errnoCopy);
-      }
-    }
+    const SocketOptionMap& options,
+    SocketOptionKey::ApplyPos pos) {
+  auto result = applySocketOptions(fd_, options, pos);
+  if (result != 0) {
+    throw AsyncSocketException(
+        AsyncSocketException::INTERNAL_ERROR,
+        withAddr("failed to set socket option"),
+        result);
   }
 }
 
@@ -1979,6 +2048,39 @@ bool AsyncSocket::processZeroCopyWriteInProgress() noexcept {
   return idZeroCopyBufPtrMap_.empty();
 }
 
+void AsyncSocket::addLifecycleObserver(
+    AsyncTransport::LifecycleObserver* observer) {
+  if (eventBase_) {
+    eventBase_->dcheckIsInEventBaseThread();
+  }
+  lifecycleObservers_.push_back(observer);
+  observer->observerAttach(this);
+}
+
+bool AsyncSocket::removeLifecycleObserver(
+    AsyncTransport::LifecycleObserver* observer) {
+  const auto eraseIt = std::remove(
+      lifecycleObservers_.begin(), lifecycleObservers_.end(), observer);
+  if (eraseIt == lifecycleObservers_.end()) {
+    return false;
+  }
+
+  for (auto it = eraseIt; it != lifecycleObservers_.end(); it++) {
+    (*it)->observerDetach(this);
+  }
+  lifecycleObservers_.erase(eraseIt, lifecycleObservers_.end());
+  return true;
+}
+
+std::vector<AsyncTransport::LifecycleObserver*>
+AsyncSocket::getLifecycleObservers() const {
+  if (eventBase_) {
+    eventBase_->dcheckIsInEventBaseThread();
+  }
+  return std::vector<AsyncTransport::LifecycleObserver*>(
+      lifecycleObservers_.begin(), lifecycleObservers_.end());
+}
+
 void AsyncSocket::handleRead() noexcept {
   VLOG(5) << "AsyncSocket::handleRead() this=" << this << ", fd=" << fd_
           << ", state=" << state_;
@@ -2005,9 +2107,9 @@ void AsyncSocket::handleRead() noexcept {
   // AsyncSocket between threads properly.  This will be sufficient to ensure
   // that this thread sees the updated eventBase_ variable after
   // readDataAvailable() returns.)
-  uint16_t numReads = 0;
+  size_t numReads = maxReadsPerEvent_ ? maxReadsPerEvent_ : size_t(-1);
   EventBase* originalEventBase = eventBase_;
-  while (readCallback_ && eventBase_ == originalEventBase) {
+  while (readCallback_ && eventBase_ == originalEventBase && numReads--) {
     // Get the buffer to read into.
     void* buf = nullptr;
     size_t buflen = 0, offset = 0;
@@ -2084,14 +2186,12 @@ void AsyncSocket::handleRead() noexcept {
       callback->readEOF();
       return;
     }
-    if (maxReadsPerEvent_ && (++numReads >= maxReadsPerEvent_)) {
-      if (readCallback_ != nullptr) {
-        // We might still have data in the socket.
-        // (e.g. see comment in AsyncSSLSocket::checkForImmediateRead)
-        scheduleImmediateRead();
-      }
-      return;
-    }
+  }
+
+  if (readCallback_ && eventBase_ == originalEventBase) {
+    // We might still have data in the socket.
+    // (e.g. see comment in AsyncSSLSocket::checkForImmediateRead)
+    scheduleImmediateRead();
   }
 }
 
@@ -2747,13 +2847,17 @@ void AsyncSocket::failWrite(
   VLOG(4) << "AsyncSocket(this=" << this << ", fd=" << fd_
           << ", state=" << state_ << " host=" << addr_.describe()
           << "): failed while writing in " << fn << "(): " << ex.what();
-  startFail();
+  if (closeOnFailedWrite_) {
+    startFail();
+  }
 
   if (callback != nullptr) {
     callback->writeErr(bytesWritten, ex);
   }
 
-  finishFail();
+  if (closeOnFailedWrite_) {
+    finishFail();
+  }
 }
 
 void AsyncSocket::failAllWrites(const AsyncSocketException& ex) {
@@ -2839,6 +2943,9 @@ void AsyncSocket::invokeConnectErr(const AsyncSocketException& ex) {
 
 void AsyncSocket::invokeConnectSuccess() {
   connectEndTime_ = std::chrono::steady_clock::now();
+  for (const auto& cb : lifecycleObservers_) {
+    cb->connect(this);
+  }
   if (connectCallback_) {
     ConnectCallback* callback = connectCallback_;
     connectCallback_ = nullptr;
@@ -2889,6 +2996,9 @@ void AsyncSocket::invalidState(WriteCallback* callback) {
 }
 
 void AsyncSocket::doClose() {
+  for (const auto& cb : lifecycleObservers_) {
+    cb->close(this);
+  }
   if (fd_ == NetworkSocket()) {
     return;
   }
@@ -2927,8 +3037,11 @@ std::string AsyncSocket::withAddr(folly::StringPiece s) {
     // ignore
   }
 
-  return folly::to<std::string>(
-      s, " (peer=", peer.describe(), ", local=", local.describe(), ")");
+  return fmt::format(
+      "{} (peer={}{})",
+      s,
+      peer.describe(),
+      kIsMobile ? "" : fmt::format(", local={}", local.describe()));
 }
 
 void AsyncSocket::setBufferCallback(BufferCallback* cb) {

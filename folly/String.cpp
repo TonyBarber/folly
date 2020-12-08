@@ -223,9 +223,7 @@ void stringAppendfImpl(std::string& output, const char* format, va_list args) {
 std::string stringPrintf(const char* format, ...) {
   va_list ap;
   va_start(ap, format);
-  SCOPE_EXIT {
-    va_end(ap);
-  };
+  SCOPE_EXIT { va_end(ap); };
   return stringVPrintf(format, ap);
 }
 
@@ -240,9 +238,7 @@ std::string stringVPrintf(const char* format, va_list ap) {
 std::string& stringAppendf(std::string* output, const char* format, ...) {
   va_list ap;
   va_start(ap, format);
-  SCOPE_EXIT {
-    va_end(ap);
-  };
+  SCOPE_EXIT { va_end(ap); };
   return stringVAppendf(output, format, ap);
 }
 
@@ -255,9 +251,7 @@ stringVAppendf(std::string* output, const char* format, va_list ap) {
 void stringPrintf(std::string* output, const char* format, ...) {
   va_list ap;
   va_start(ap, format);
-  SCOPE_EXIT {
-    va_end(ap);
-  };
+  SCOPE_EXIT { va_end(ap); };
   return stringVPrintf(output, format, ap);
 }
 
@@ -472,7 +466,7 @@ std::string hexDump(const void* ptr, size_t size) {
 // selects proper function.
 
 FOLLY_MAYBE_UNUSED
-static fbstring invoke_strerror_r(
+static std::string invoke_strerror_r(
     int (*strerror_r)(int, char*, size_t),
     int err,
     char* buf,
@@ -482,7 +476,7 @@ static fbstring invoke_strerror_r(
 
   // OSX/FreeBSD use EINVAL and Linux uses -1 so just check for non-zero
   if (r != 0) {
-    return to<fbstring>(
+    return to<std::string>(
         "Unknown error ", err, " (strerror_r failed with error ", errno, ")");
   } else {
     return buf;
@@ -490,7 +484,7 @@ static fbstring invoke_strerror_r(
 }
 
 FOLLY_MAYBE_UNUSED
-static fbstring invoke_strerror_r(
+static std::string invoke_strerror_r(
     char* (*strerror_r)(int, char*, size_t),
     int err,
     char* buf,
@@ -499,7 +493,7 @@ static fbstring invoke_strerror_r(
   return strerror_r(err, buf, buflen);
 }
 
-fbstring errnoStr(int err) {
+std::string errnoStr(int err) {
   int savedErrno = errno;
 
   // Ensure that we reset errno upon exit.
@@ -508,7 +502,7 @@ fbstring errnoStr(int err) {
   char buf[1024];
   buf[0] = '\0';
 
-  fbstring result;
+  std::string result;
 
   // https://developer.apple.com/library/mac/documentation/Darwin/Reference/ManPages/man3/strerror_r.3.html
   // http://www.kernel.org/doc/man-pages/online/pages/man3/strerror.3.html
@@ -518,7 +512,7 @@ fbstring errnoStr(int err) {
   // with strerrorlen_s). Note strerror_r and _s have swapped args.
   int r = strerror_s(buf, sizeof(buf), err);
   if (r != 0) {
-    result = to<fbstring>(
+    result = to<std::string>(
         "Unknown error ", err, " (strerror_r failed with error ", errno, ")");
   } else {
     result.assign(buf);

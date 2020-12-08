@@ -101,23 +101,17 @@ struct TrickyAwaitable {
   struct Awaiter {
     std::unique_ptr<int> value_;
 
-    bool await_ready() const {
-      return false;
-    }
+    bool await_ready() const { return false; }
 
     bool await_suspend(std::experimental::coroutine_handle<>) {
       value_ = std::make_unique<int>(42);
       return false;
     }
 
-    std::unique_ptr<int>&& await_resume() {
-      return std::move(value_);
-    }
+    std::unique_ptr<int>&& await_resume() { return std::move(value_); }
   };
 
-  Awaiter operator co_await() {
-    return {};
-  }
+  Awaiter operator co_await() { return {}; }
 };
 
 TEST_F(BlockingWaitTest, ReturnRvalueReferenceFromAwaiter) {
@@ -134,9 +128,7 @@ TEST_F(BlockingWaitTest, ReturnRvalueReferenceFromAwaiter) {
 TEST_F(BlockingWaitTest, AsynchronousCompletionOnAnotherThread) {
   folly::coro::Baton baton;
   std::thread t{[&] { baton.post(); }};
-  SCOPE_EXIT {
-    t.join();
-  };
+  SCOPE_EXIT { t.join(); };
   folly::coro::blockingWait(baton);
 }
 
@@ -150,9 +142,7 @@ class SimplePromise {
         folly::Optional<T>& value) noexcept
         : awaiter_(baton), value_(value) {}
 
-    bool await_ready() {
-      return awaiter_.await_ready();
-    }
+    bool await_ready() { return awaiter_.await_ready(); }
 
     template <typename Promise>
     auto await_suspend(std::experimental::coroutine_handle<Promise> h) {
@@ -171,9 +161,7 @@ class SimplePromise {
 
   SimplePromise() = default;
 
-  WaitOperation operator co_await() {
-    return WaitOperation{baton_, value_};
-  }
+  WaitOperation operator co_await() { return WaitOperation{baton_, value_}; }
 
   template <typename... Args>
   void emplace(Args&&... args) {
@@ -189,9 +177,7 @@ class SimplePromise {
 TEST_F(BlockingWaitTest, WaitOnSimpleAsyncPromise) {
   SimplePromise<std::string> p;
   std::thread t{[&] { p.emplace("hello coroutines!"); }};
-  SCOPE_EXIT {
-    t.join();
-  };
+  SCOPE_EXIT { t.join(); };
   auto result = folly::coro::blockingWait(p);
   EXPECT_EQ("hello coroutines!", result);
 }
@@ -206,9 +192,7 @@ struct MoveCounting {
 TEST_F(BlockingWaitTest, WaitOnMoveOnlyAsyncPromise) {
   SimplePromise<MoveCounting> p;
   std::thread t{[&] { p.emplace(); }};
-  SCOPE_EXIT {
-    t.join();
-  };
+  SCOPE_EXIT { t.join(); };
   auto result = folly::coro::blockingWait(p);
 
   // Number of move-constructions:
@@ -255,8 +239,13 @@ TEST_F(BlockingWaitTest, WaitTaskInFiber) {
   auto& fm = folly::fibers::getFiberManager(evb);
 
   auto future = fm.addTaskFuture([&] {
-    return folly::coro::blockingWait(folly::coro::co_invoke(
-        [&]() -> folly::coro::Task<int> { co_return co_await promise; }));
+    return folly::coro::blockingWait(
+        folly::coro::co_invoke([&]() -> folly::coro::Task<int> {
+          EXPECT_FALSE(folly::fibers::onFiber());
+          auto ret = co_await promise;
+          EXPECT_FALSE(folly::fibers::onFiber());
+          co_return ret;
+        }));
   });
 
   evb.loopOnce();
@@ -267,6 +256,28 @@ TEST_F(BlockingWaitTest, WaitTaskInFiber) {
   evb.loopOnce();
   EXPECT_TRUE(future.isReady());
   EXPECT_EQ(42, std::move(future).get());
+}
+
+struct ExpectedException {};
+
+TEST_F(BlockingWaitTest, WaitTaskInFiberException) {
+  folly::EventBase evb;
+  auto& fm = folly::fibers::getFiberManager(evb);
+  EXPECT_TRUE(
+      fm.addTaskFuture([&] {
+          try {
+            folly::coro::blockingWait(
+                folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+                  folly::via(
+                      co_await folly::coro::co_current_executor, []() {});
+                  throw ExpectedException();
+                }));
+            return false;
+          } catch (const ExpectedException&) {
+            return true;
+          }
+        })
+          .getVia(&evb));
 }
 
 TEST_F(BlockingWaitTest, WaitOnSemiFuture) {
@@ -299,6 +310,34 @@ TEST_F(BlockingWaitTest, DrivableExecutor) {
         EXPECT_EQ(&executor, taskExecutor);
       }(),
       &executor);
+}
+
+TEST_F(BlockingWaitTest, ReleaseExecutorFromAnotherThread) {
+  auto fn = []() {
+    auto c1 = folly::makePromiseContract<folly::Executor::KeepAlive<>>();
+    auto c2 = folly::makePromiseContract<folly::Unit>();
+    std::thread t{[&] {
+      auto e = std::move(c1.second).get();
+      c2.first.setValue(folly::Unit{});
+      std::this_thread::sleep_for(std::chrono::microseconds(1));
+      e = {};
+    }};
+    folly::ManualExecutor executor;
+    folly::coro::blockingWait([&]() -> folly::coro::Task<void> {
+      folly::Executor::KeepAlive<> taskExecutor =
+          co_await folly::coro::co_current_executor;
+      c1.first.setValue(std::move(taskExecutor));
+      co_await std::move(c2.second);
+    }());
+    t.join();
+  };
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 100; ++i) {
+    threads.emplace_back(fn);
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
 }
 
 #endif

@@ -63,18 +63,14 @@ namespace folly {
 template <typename Int, typename Tag>
 class SingletonRelaxedCounter {
  public:
-  static void add(Int value) {
-    mutate(+to_signed(value));
-  }
-  static void sub(Int value) {
-    mutate(-to_signed(value));
-  }
+  static void add(Int value) { mutate(+to_signed(value)); }
+  static void sub(Int value) { mutate(-to_signed(value)); }
 
   static Int count() {
     auto const& global = Global::instance();
     auto count = global.fallback.load(std::memory_order_relaxed);
     auto const tracking = global.tracking.rlock();
-    for (auto const kvp : tracking->locals) {
+    for (auto const& kvp : tracking->locals) {
       count += kvp.first->load(std::memory_order_relaxed);
     }
     return std::is_unsigned<Int>::value

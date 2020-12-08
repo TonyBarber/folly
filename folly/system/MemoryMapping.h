@@ -210,9 +210,7 @@ class MemoryMapping {
   /**
    * A range of bytes mapped by this mapping.
    */
-  ByteRange range() const {
-    return data_;
-  }
+  ByteRange range() const { return data_; }
 
   /**
    * A bitwise cast of the mapped bytes as range of mutable values. Only
@@ -237,17 +235,11 @@ class MemoryMapping {
    * Return the memory area where the file was mapped.
    * Deprecated; use range() instead.
    */
-  StringPiece data() const {
-    return asRange<const char>();
-  }
+  StringPiece data() const { return asRange<const char>(); }
 
-  bool mlocked() const {
-    return locked_;
-  }
+  bool mlocked() const { return locked_; }
 
-  int fd() const {
-    return file_.fd();
-  }
+  int fd() const { return file_.fd(); }
 
  private:
   MemoryMapping();
@@ -284,5 +276,13 @@ void alignedForwardMemcpy(void* dst, const void* src, size_t size);
  * Copy a file using mmap(). Overwrites dest.
  */
 void mmapFileCopy(const char* src, const char* dest, mode_t mode = 0666);
+
+/**
+ * mlock2 is Linux-only and exists since Linux 4.4
+ * On Linux pre-4.4 and other platforms fail with ENOSYS.
+ * glibc added the mlock2 wrapper in 2.27
+ * https://lists.gnu.org/archive/html/info-gnu/2018-02/msg00000.html
+ */
+int mlock2wrapper(const void* addr, size_t len, MemoryMapping::LockFlags flags);
 
 } // namespace folly

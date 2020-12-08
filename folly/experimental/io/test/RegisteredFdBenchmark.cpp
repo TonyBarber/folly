@@ -85,14 +85,22 @@ class EventFD : public EventHandler {
 class BackendEventBase : public EventBase {
  public:
   explicit BackendEventBase(bool useRegisteredFds, size_t capacity = 32 * 1024)
-      : EventBase(getBackend(useRegisteredFds, capacity), false) {}
+      : EventBase(EventBase::Options()
+                      .setBackendFactory([useRegisteredFds, capacity] {
+                        return getBackend(useRegisteredFds, capacity);
+                      })
+                      .setSkipTimeMeasurement(true)) {}
 
  private:
   static std::unique_ptr<folly::EventBaseBackendBase> getBackend(
       bool useRegisteredFds,
       size_t capacity) {
-    return std::make_unique<IoUringBackend>(
-        capacity, 256, 128, useRegisteredFds);
+    folly::PollIoBackend::Options options;
+    options.setCapacity(capacity)
+        .setMaxSubmit(256)
+        .setMaxGet(128)
+        .setUseRegisteredFds(useRegisteredFds);
+    return std::make_unique<IoUringBackend>(options);
   }
 };
 

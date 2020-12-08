@@ -32,15 +32,10 @@
 namespace folly {
 namespace sync_tests {
 
-inline std::mt19937& getRNG() {
-  static const auto seed = folly::randomNumberSeed();
-  static std::mt19937 rng(seed);
-  return rng;
-}
-
 void randomSleep(std::chrono::milliseconds min, std::chrono::milliseconds max) {
   std::uniform_int_distribution<> range(min.count(), max.count());
-  std::chrono::milliseconds duration(range(getRNG()));
+  folly::ThreadLocalPRNG prng;
+  std::chrono::milliseconds duration(range(prng));
   /* sleep override */
   std::this_thread::sleep_for(duration);
 }
@@ -458,7 +453,7 @@ testUnlock() {
 
 // Testing the deprecated SYNCHRONIZED and SYNCHRONIZED_CONST APIs
 template <class Mutex>
-void testDeprecated() {
+[[deprecated]] void testDeprecated() {
   folly::Synchronized<std::vector<int>, Mutex> obj;
 
   obj.contextualLock()->resize(1000);
@@ -473,13 +468,9 @@ void testDeprecated() {
     EXPECT_EQ(1000, obj2.contextualLock()->size());
   }
 
-  SYNCHRONIZED_CONST(obj) {
-    EXPECT_EQ(1001, obj.size());
-  }
+  SYNCHRONIZED_CONST(obj) { EXPECT_EQ(1001, obj.size()); }
 
-  SYNCHRONIZED(lockedObj, *&obj) {
-    lockedObj.front() = 2;
-  }
+  SYNCHRONIZED(lockedObj, *&obj) { lockedObj.front() = 2; }
 
   EXPECT_EQ(1001, obj.contextualLock()->size());
   EXPECT_EQ(10, obj.contextualLock()->back());
@@ -585,7 +576,7 @@ void testAcquireLockedWithConst() {
 
 // Testing the deprecated SYNCHRONIZED_DUAL API
 template <class Mutex>
-void testDualLocking() {
+[[deprecated]] void testDualLocking() {
   folly::Synchronized<std::vector<int>, Mutex> v;
   folly::Synchronized<std::map<int, int>, Mutex> m;
 
@@ -618,7 +609,7 @@ void testDualLocking() {
 
 // Testing the deprecated SYNCHRONIZED_DUAL API
 template <class Mutex>
-void testDualLockingWithConst() {
+[[deprecated]] void testDualLockingWithConst() {
   folly::Synchronized<std::vector<int>, Mutex> v;
   folly::Synchronized<std::map<int, int>, Mutex> m;
 
@@ -758,107 +749,6 @@ void testTimedShared() {
   // number of read timeouts.
   LOG(INFO) << "testTimedShared: " << *numTimeouts.contextualRLock()
             << " timeouts";
-}
-
-// Testing the deprecated TIMED_SYNCHRONIZED API
-template <class Mutex>
-void testTimedSynchronized() {
-  folly::Synchronized<std::vector<int>, Mutex> v;
-  folly::Synchronized<uint64_t, Mutex> numTimeouts{0};
-
-  auto worker = [&](size_t threadIdx) {
-    // Test contextualLock()
-    v.contextualLock()->push_back(2 * threadIdx);
-
-    // Aaand test the TIMED_SYNCHRONIZED macro
-    for (;;) {
-      TIMED_SYNCHRONIZED(5, lv, v) {
-        if (lv) {
-          // Sleep for a random time to ensure we trigger timeouts
-          // in other threads
-          randomSleep(
-              std::chrono::milliseconds(5), std::chrono::milliseconds(15));
-          lv->push_back(2 * threadIdx + 1);
-          return;
-        }
-
-        ++(*numTimeouts.contextualLock());
-      }
-    }
-  };
-
-  static const size_t numThreads = 100;
-  runParallel(numThreads, worker);
-
-  std::vector<int> result;
-  v.swap(result);
-
-  EXPECT_EQ(2 * numThreads, result.size());
-  sort(result.begin(), result.end());
-
-  for (size_t i = 0; i < 2 * numThreads; ++i) {
-    EXPECT_EQ(i, result[i]);
-  }
-  // We generally expect a large number of number timeouts here.
-  // I'm not adding a check for it since it's theoretically possible that
-  // we might get 0 timeouts depending on the CPU scheduling if our threads
-  // don't get to run very often.
-  LOG(INFO) << "testTimedSynchronized: " << *numTimeouts.contextualRLock()
-            << " timeouts";
-}
-
-// Testing the deprecated TIMED_SYNCHRONIZED_CONST API
-template <class Mutex>
-void testTimedSynchronizedWithConst() {
-  folly::Synchronized<std::vector<int>, Mutex> v;
-  folly::Synchronized<uint64_t, Mutex> numTimeouts{0};
-
-  auto worker = [&](size_t threadIdx) {
-    // Test contextualLock()
-    v.contextualLock()->push_back(threadIdx);
-
-    // Test TIMED_SYNCHRONIZED_CONST
-    for (;;) {
-      TIMED_SYNCHRONIZED_CONST(10, lv, v) {
-        if (lv) {
-          // Sleep while holding the lock.
-          //
-          // This will block other threads from acquiring the write lock to add
-          // their thread index to v, but it won't block threads that have
-          // entered the for loop and are trying to acquire a read lock.
-          //
-          // For lock types that give preference to readers rather than writers,
-          // this will tend to serialize all threads on the wlock() above.
-          randomSleep(
-              std::chrono::milliseconds(5), std::chrono::milliseconds(15));
-          auto found = std::find(lv->begin(), lv->end(), threadIdx);
-          CHECK(found != lv->end());
-          return;
-        } else {
-          ++(*numTimeouts.contextualLock());
-        }
-      }
-    }
-  };
-
-  static const size_t numThreads = 100;
-  runParallel(numThreads, worker);
-
-  std::vector<int> result;
-  v.swap(result);
-
-  EXPECT_EQ(numThreads, result.size());
-  sort(result.begin(), result.end());
-
-  for (size_t i = 0; i < numThreads; ++i) {
-    EXPECT_EQ(i, result[i]);
-  }
-  // We generally expect a small number of timeouts here.
-  // For locks that give readers preference over writers this should usually
-  // be 0.  With locks that give writers preference we do see a small-ish
-  // number of read timeouts.
-  LOG(INFO) << "testTimedSynchronizedWithConst: "
-            << *numTimeouts.contextualRLock() << " timeouts";
 }
 
 template <class Mutex>

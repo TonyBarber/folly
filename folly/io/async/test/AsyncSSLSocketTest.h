@@ -22,6 +22,7 @@
 #include <folly/SocketAddress.h>
 #include <folly/experimental/TestUtil.h>
 #include <folly/fibers/FiberManagerMap.h>
+#include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncSSLSocket.h>
 #include <folly/io/async/AsyncServerSocket.h>
 #include <folly/io/async/AsyncSocket.h>
@@ -30,9 +31,11 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/ssl/SSLErrors.h>
 #include <folly/io/async/test/TestSSLServer.h>
+#include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <folly/portability/PThread.h>
 #include <folly/portability/Sockets.h>
+#include <folly/portability/String.h>
 #include <folly/portability/Unistd.h>
 
 #include <fcntl.h>
@@ -89,9 +92,7 @@ class SendMsgFlagsCallback : public SendMsgParamsCallbackBase {
  public:
   SendMsgFlagsCallback() {}
 
-  void resetFlags(int flags) {
-    flags_ = flags;
-  }
+  void resetFlags(int flags) { flags_ = flags; }
 
   int getFlagsImpl(
       folly::WriteFlags flags,
@@ -113,16 +114,12 @@ class SendMsgAncillaryDataCallback : public SendMsgParamsCallbackBase {
   /**
    * This data will be returned on calls to getAncillaryData.
    */
-  void resetData(std::vector<char>&& data) {
-    ancillaryData_.swap(data);
-  }
+  void resetData(std::vector<char>&& data) { ancillaryData_.swap(data); }
 
   /**
    * These flags were observed on the last call to getAncillaryData.
    */
-  folly::WriteFlags getObservedWriteFlags() {
-    return observedWriteFlags_;
-  }
+  folly::WriteFlags getObservedWriteFlags() { return observedWriteFlags_; }
 
   void getAncillaryData(folly::WriteFlags flags, void* data) noexcept override {
     // getAncillaryData is called through a long chain of functions after send
@@ -150,7 +147,7 @@ class SendMsgAncillaryDataCallback : public SendMsgParamsCallbackBase {
   std::vector<char> ancillaryData_;
 };
 
-class WriteCallbackBase : public AsyncTransportWrapper::WriteCallback {
+class WriteCallbackBase : public AsyncTransport::WriteCallback {
  public:
   explicit WriteCallbackBase(SendMsgParamsCallbackBase* mcb = nullptr)
       : state(STATE_WAITING),
@@ -158,9 +155,7 @@ class WriteCallbackBase : public AsyncTransportWrapper::WriteCallback {
         exception(AsyncSocketException::UNKNOWN, "none"),
         mcb_(mcb) {}
 
-  ~WriteCallbackBase() override {
-    EXPECT_EQ(STATE_SUCCEEDED, state);
-  }
+  ~WriteCallbackBase() override { EXPECT_EQ(STATE_SUCCEEDED, state); }
 
   virtual void setSocket(const std::shared_ptr<AsyncSSLSocket>& socket) {
     socket_ = socket;
@@ -226,9 +221,7 @@ class WriteCheckTimestampCallback : public WriteCallbackBase {
   explicit WriteCheckTimestampCallback(SendMsgParamsCallbackBase* mcb = nullptr)
       : WriteCallbackBase(mcb) {}
 
-  ~WriteCheckTimestampCallback() override {
-    EXPECT_EQ(STATE_SUCCEEDED, state);
-  }
+  ~WriteCheckTimestampCallback() override { EXPECT_EQ(STATE_SUCCEEDED, state); }
 
   void setSocket(const std::shared_ptr<AsyncSSLSocket>& socket) override {
     WriteCallbackBase::setSocket(socket);
@@ -236,7 +229,7 @@ class WriteCheckTimestampCallback : public WriteCallbackBase {
     EXPECT_NE(socket_->getNetworkSocket(), NetworkSocket());
     int flags = SOF_TIMESTAMPING_OPT_ID | SOF_TIMESTAMPING_OPT_TSONLY |
         SOF_TIMESTAMPING_SOFTWARE;
-    AsyncSocket::OptionKey tstampingOpt = {SOL_SOCKET, SO_TIMESTAMPING};
+    SocketOptionKey tstampingOpt = {SOL_SOCKET, SO_TIMESTAMPING};
     int ret = tstampingOpt.apply(socket_->getNetworkSocket(), flags);
     EXPECT_EQ(ret, 0);
   }
@@ -319,14 +312,12 @@ class WriteCheckTimestampCallback : public WriteCallbackBase {
 };
 #endif // FOLLY_HAVE_MSG_ERRQUEUE
 
-class ReadCallbackBase : public AsyncTransportWrapper::ReadCallback {
+class ReadCallbackBase : public AsyncTransport::ReadCallback {
  public:
   explicit ReadCallbackBase(WriteCallbackBase* wcb)
       : wcb_(wcb), state(STATE_WAITING) {}
 
-  ~ReadCallbackBase() override {
-    EXPECT_EQ(STATE_SUCCEEDED, state);
-  }
+  ~ReadCallbackBase() override { EXPECT_EQ(STATE_SUCCEEDED, state); }
 
   void setSocket(const std::shared_ptr<AsyncSSLSocket>& socket) {
     socket_ = socket;
@@ -404,9 +395,7 @@ class ReadCallback : public ReadCallbackBase {
   /**
    * These flags will be used when writing the read data back to the socket.
    */
-  void setWriteFlags(folly::WriteFlags flags) {
-    writeFlags = flags;
-  }
+  void setWriteFlags(folly::WriteFlags flags) { writeFlags = flags; }
 
   class Buffer {
    public:
@@ -536,6 +525,43 @@ class EmptyReadCallback : public ReadCallback {
   std::shared_ptr<AsyncSocket> tcpSocket_;
 };
 
+class MockCertificateIdentityVerifier : public CertificateIdentityVerifier {
+ public:
+  MOCK_CONST_METHOD1(
+      verifyLeafImpl,
+      Try<Unit>(const AsyncTransportCertificate&));
+  // decorate to add noexcept
+  virtual Try<Unit> verifyLeaf(const AsyncTransportCertificate& leafCertificate)
+      const noexcept override {
+    return verifyLeafImpl(leafCertificate);
+  }
+};
+
+class MockHandshakeCB : public AsyncSSLSocket::HandshakeCB {
+ public:
+  MOCK_METHOD3(handshakeVerImpl, bool(AsyncSSLSocket*, bool, X509_STORE_CTX*));
+  virtual bool handshakeVer(
+      AsyncSSLSocket* sock,
+      bool preverifyOk,
+      X509_STORE_CTX* ctx) noexcept override {
+    return handshakeVerImpl(sock, preverifyOk, ctx);
+  }
+
+  MOCK_METHOD1(handshakeSucImpl, void(AsyncSSLSocket*));
+  virtual void handshakeSuc(AsyncSSLSocket* sock) noexcept override {
+    handshakeSucImpl(sock);
+  }
+
+  MOCK_METHOD2(
+      handshakeErrImpl,
+      void(AsyncSSLSocket*, const AsyncSocketException&));
+  virtual void handshakeErr(
+      AsyncSSLSocket* sock,
+      const AsyncSocketException& ex) noexcept override {
+    handshakeErrImpl(sock, ex);
+  }
+};
+
 class HandshakeCallback : public AsyncSSLSocket::HandshakeCB {
  public:
   enum ExpectType { EXPECT_SUCCESS, EXPECT_ERROR };
@@ -585,22 +611,16 @@ class HandshakeCallback : public AsyncSSLSocket::HandshakeCB {
     cv_.wait(lock, [this] { return state != STATE_WAITING; });
   }
 
-  ~HandshakeCallback() override {
-    EXPECT_EQ(STATE_SUCCEEDED, state);
-  }
+  ~HandshakeCallback() override { EXPECT_EQ(STATE_SUCCEEDED, state); }
 
   void closeSocket() {
     socket_->close();
     state = STATE_SUCCEEDED;
   }
 
-  std::shared_ptr<AsyncSSLSocket> getSocket() {
-    return socket_;
-  }
+  std::shared_ptr<AsyncSSLSocket> getSocket() { return socket_; }
 
-  bool isResumed() const {
-    return isResumed_;
-  }
+  bool isResumed() const { return isResumed_; }
 
   StateEnum state;
   std::shared_ptr<AsyncSSLSocket> socket_;
@@ -770,7 +790,7 @@ void sslsocketpair(
     AsyncSSLSocket::UniquePtr* serverSock);
 
 class BlockingWriteClient : private AsyncSSLSocket::HandshakeCB,
-                            private AsyncTransportWrapper::WriteCallback {
+                            private AsyncTransport::WriteCallback {
  public:
   explicit BlockingWriteClient(AsyncSSLSocket::UniquePtr socket)
       : socket_(std::move(socket)), bufLen_(2500), iovCount_(2000) {
@@ -797,9 +817,7 @@ class BlockingWriteClient : private AsyncSSLSocket::HandshakeCB,
   struct iovec* getIovec() const {
     return iov_.get();
   }
-  uint32_t getIovecCount() const {
-    return iovCount_;
-  }
+  uint32_t getIovecCount() const { return iovCount_; }
 
  private:
   void handshakeSuc(AsyncSSLSocket*) noexcept override {
@@ -810,9 +828,7 @@ class BlockingWriteClient : private AsyncSSLSocket::HandshakeCB,
       const AsyncSocketException& ex) noexcept override {
     ADD_FAILURE() << "client handshake error: " << ex.what();
   }
-  void writeSuccess() noexcept override {
-    socket_->close();
-  }
+  void writeSuccess() noexcept override { socket_->close(); }
   void writeErr(
       size_t bytesWritten,
       const AsyncSocketException& ex) noexcept override {
@@ -828,7 +844,7 @@ class BlockingWriteClient : private AsyncSSLSocket::HandshakeCB,
 };
 
 class BlockingWriteServer : private AsyncSSLSocket::HandshakeCB,
-                            private AsyncTransportWrapper::ReadCallback {
+                            private AsyncTransport::ReadCallback {
  public:
   explicit BlockingWriteServer(AsyncSSLSocket::UniquePtr socket)
       : socket_(std::move(socket)), bufSize_(2500 * 2000), bytesRead_(0) {
@@ -883,9 +899,7 @@ class BlockingWriteServer : private AsyncSSLSocket::HandshakeCB,
     socket_->getEventBase()->tryRunAfterDelay(
         [this] { socket_->setReadCB(this); }, 2);
   }
-  void readEOF() noexcept override {
-    socket_->close();
-  }
+  void readEOF() noexcept override { socket_->close(); }
   void readErr(const AsyncSocketException& ex) noexcept override {
     ADD_FAILURE() << "server read error: " << ex.what();
   }
@@ -897,7 +911,7 @@ class BlockingWriteServer : private AsyncSSLSocket::HandshakeCB,
 };
 
 class AlpnClient : private AsyncSSLSocket::HandshakeCB,
-                   private AsyncTransportWrapper::WriteCallback {
+                   private AsyncTransport::WriteCallback {
  public:
   explicit AlpnClient(AsyncSSLSocket::UniquePtr socket)
       : nextProto(nullptr), nextProtoLength(0), socket_(std::move(socket)) {
@@ -917,9 +931,7 @@ class AlpnClient : private AsyncSSLSocket::HandshakeCB,
       const AsyncSocketException& ex) noexcept override {
     except = ex;
   }
-  void writeSuccess() noexcept override {
-    socket_->close();
-  }
+  void writeSuccess() noexcept override { socket_->close(); }
   void writeErr(
       size_t bytesWritten,
       const AsyncSocketException& ex) noexcept override {
@@ -931,7 +943,7 @@ class AlpnClient : private AsyncSSLSocket::HandshakeCB,
 };
 
 class AlpnServer : private AsyncSSLSocket::HandshakeCB,
-                   private AsyncTransportWrapper::ReadCallback {
+                   private AsyncTransport::ReadCallback {
  public:
   explicit AlpnServer(AsyncSSLSocket::UniquePtr socket)
       : nextProto(nullptr), nextProtoLength(0), socket_(std::move(socket)) {
@@ -955,9 +967,7 @@ class AlpnServer : private AsyncSSLSocket::HandshakeCB,
     *lenReturn = 0;
   }
   void readDataAvailable(size_t /* len */) noexcept override {}
-  void readEOF() noexcept override {
-    socket_->close();
-  }
+  void readEOF() noexcept override { socket_->close(); }
   void readErr(const AsyncSocketException& ex) noexcept override {
     ADD_FAILURE() << "server read error: " << ex.what();
   }
@@ -966,16 +976,14 @@ class AlpnServer : private AsyncSSLSocket::HandshakeCB,
 };
 
 class RenegotiatingServer : public AsyncSSLSocket::HandshakeCB,
-                            public AsyncTransportWrapper::ReadCallback {
+                            public AsyncTransport::ReadCallback {
  public:
   explicit RenegotiatingServer(AsyncSSLSocket::UniquePtr socket)
       : socket_(std::move(socket)) {
     socket_->sslAccept(this);
   }
 
-  ~RenegotiatingServer() override {
-    socket_->setReadCB(nullptr);
-  }
+  ~RenegotiatingServer() override { socket_->setReadCB(nullptr); }
 
   void handshakeSuc(AsyncSSLSocket* /* socket */) noexcept override {
     LOG(INFO) << "Renegotiating server handshake success";
@@ -1009,7 +1017,7 @@ class RenegotiatingServer : public AsyncSSLSocket::HandshakeCB,
 
 #ifndef OPENSSL_NO_TLSEXT
 class SNIClient : private AsyncSSLSocket::HandshakeCB,
-                  private AsyncTransportWrapper::WriteCallback {
+                  private AsyncTransport::WriteCallback {
  public:
   explicit SNIClient(AsyncSSLSocket::UniquePtr socket)
       : serverNameMatch(false), socket_(std::move(socket)) {
@@ -1027,9 +1035,7 @@ class SNIClient : private AsyncSSLSocket::HandshakeCB,
       const AsyncSocketException& ex) noexcept override {
     ADD_FAILURE() << "client handshake error: " << ex.what();
   }
-  void writeSuccess() noexcept override {
-    socket_->close();
-  }
+  void writeSuccess() noexcept override { socket_->close(); }
   void writeErr(
       size_t bytesWritten,
       const AsyncSocketException& ex) noexcept override {
@@ -1041,7 +1047,7 @@ class SNIClient : private AsyncSSLSocket::HandshakeCB,
 };
 
 class SNIServer : private AsyncSSLSocket::HandshakeCB,
-                  private AsyncTransportWrapper::ReadCallback {
+                  private AsyncTransport::ReadCallback {
  public:
   explicit SNIServer(
       AsyncSSLSocket::UniquePtr socket,
@@ -1070,9 +1076,7 @@ class SNIServer : private AsyncSSLSocket::HandshakeCB,
     *lenReturn = 0;
   }
   void readDataAvailable(size_t /* len */) noexcept override {}
-  void readEOF() noexcept override {
-    socket_->close();
-  }
+  void readEOF() noexcept override { socket_->close(); }
   void readErr(const AsyncSocketException& ex) noexcept override {
     ADD_FAILURE() << "server read error: " << ex.what();
   }
@@ -1097,12 +1101,12 @@ class SNIServer : private AsyncSSLSocket::HandshakeCB,
 #endif
 
 class SSLClient : public AsyncSocket::ConnectCallback,
-                  public AsyncTransportWrapper::WriteCallback,
-                  public AsyncTransportWrapper::ReadCallback {
+                  public AsyncTransport::WriteCallback,
+                  public AsyncTransport::ReadCallback {
  private:
   EventBase* eventBase_;
   std::shared_ptr<AsyncSSLSocket> sslSocket_;
-  SSL_SESSION* session_;
+  std::shared_ptr<folly::ssl::SSLSession> session_;
   std::shared_ptr<folly::SSLContext> ctx_;
   uint32_t requests_;
   folly::SocketAddress address_;
@@ -1146,25 +1150,16 @@ class SSLClient : public AsyncSocket::ConnectCallback,
   }
 
   ~SSLClient() override {
-    if (session_) {
-      SSL_SESSION_free(session_);
-    }
     if (errors_ == 0) {
       EXPECT_EQ(bytesRead_, sizeof(buf_));
     }
   }
 
-  uint32_t getHit() const {
-    return hit_;
-  }
+  uint32_t getHit() const { return hit_; }
 
-  uint32_t getMiss() const {
-    return miss_;
-  }
+  uint32_t getMiss() const { return miss_; }
 
-  uint32_t getErrors() const {
-    return errors_;
-  }
+  uint32_t getErrors() const { return errors_; }
 
   uint32_t getWriteAfterConnectErrors() const {
     return writeAfterConnectErrors_;
@@ -1173,7 +1168,7 @@ class SSLClient : public AsyncSocket::ConnectCallback,
   void connect(bool writeNow = false) {
     sslSocket_ = AsyncSSLSocket::newSocket(ctx_, eventBase_);
     if (session_ != nullptr) {
-      sslSocket_->setSSLSession(session_);
+      sslSocket_->setSSLSessionV2(session_);
     }
     requests_--;
     sslSocket_->connect(this, address_, timeout_);
@@ -1189,10 +1184,7 @@ class SSLClient : public AsyncSocket::ConnectCallback,
       hit_++;
     } else {
       miss_++;
-      if (session_ != nullptr) {
-        SSL_SESSION_free(session_);
-      }
-      session_ = sslSocket_->getSSLSession();
+      session_ = sslSocket_->getSSLSessionV2();
     }
 
     // write()
@@ -1250,7 +1242,7 @@ class SSLClient : public AsyncSocket::ConnectCallback,
 };
 
 class SSLHandshakeBase : public AsyncSSLSocket::HandshakeCB,
-                         private AsyncTransportWrapper::WriteCallback {
+                         private AsyncTransport::WriteCallback {
  public:
   explicit SSLHandshakeBase(
       AsyncSSLSocket::UniquePtr socket,
@@ -1263,9 +1255,7 @@ class SSLHandshakeBase : public AsyncSSLSocket::HandshakeCB,
         preverifyResult_(preverifyResult),
         verifyResult_(verifyResult) {}
 
-  AsyncSSLSocket::UniquePtr moveSocket() && {
-    return std::move(socket_);
-  }
+  AsyncSSLSocket::UniquePtr moveSocket() && { return std::move(socket_); }
 
   bool handshakeVerify_;
   bool handshakeSuccess_;

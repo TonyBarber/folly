@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+#include <signal.h>
 #include <sys/timerfd.h>
 
 #include <atomic>
 
 #include <folly/FileUtil.h>
 #include <folly/Likely.h>
+#include <folly/SpinLock.h>
 #include <folly/experimental/io/PollIoBackend.h>
 #include <folly/portability/Sockets.h>
 #include <folly/synchronization/CallOnce.h>
@@ -31,6 +33,85 @@ extern "C" FOLLY_ATTR_WEAK void eb_poll_loop_post_hook(
     uint64_t call_time,
     int ret);
 
+namespace {
+struct SignalRegistry {
+  struct SigInfo {
+    struct sigaction sa_ {};
+    size_t count_{0};
+  };
+  using SignalMap = std::map<int, SigInfo>;
+
+  constexpr SignalRegistry() {}
+  ~SignalRegistry() {}
+
+  void notify(int sig);
+  void setNotifyFd(int sig, int fd);
+
+  // lock protecting the signal map
+  folly::MicroSpinLock mapLock_ = {0};
+  std::unique_ptr<SignalMap> map_;
+  std::atomic<int> notifyFd_{-1};
+};
+
+SignalRegistry sSignalRegistry;
+
+void evSigHandler(int sig) {
+  sSignalRegistry.notify(sig);
+}
+
+void SignalRegistry::notify(int sig) {
+  // use try_lock in case somebody already has the lock
+  if (mapLock_.try_lock()) {
+    int fd = notifyFd_.load();
+    if (fd >= 0) {
+      uint8_t sigNum = static_cast<uint8_t>(sig);
+      ::write(fd, &sigNum, 1);
+    }
+    mapLock_.unlock();
+  }
+}
+
+void SignalRegistry::setNotifyFd(int sig, int fd) {
+  folly::MSLGuard g(mapLock_);
+  if (fd >= 0) {
+    if (!map_) {
+      map_ = std::make_unique<SignalMap>();
+    }
+    // switch the fd
+    notifyFd_.store(fd);
+
+    auto iter = (*map_).find(sig);
+    if (iter != (*map_).end()) {
+      iter->second.count_++;
+    } else {
+      auto& entry = (*map_)[sig];
+      entry.count_ = 1;
+      struct sigaction sa = {};
+      sa.sa_handler = evSigHandler;
+      sa.sa_flags |= SA_RESTART;
+      ::sigfillset(&sa.sa_mask);
+
+      if (::sigaction(sig, &sa, &entry.sa_) == -1) {
+        (*map_).erase(sig);
+      }
+    }
+  } else {
+    notifyFd_.store(fd);
+
+    if (map_) {
+      auto iter = (*map_).find(sig);
+      if ((iter != (*map_).end()) && (--iter->second.count_ == 0)) {
+        auto entry = iter->second;
+        (*map_).erase(iter);
+        // just restore
+        ::sigaction(sig, &entry.sa_, nullptr);
+      }
+    }
+  }
+}
+
+} // namespace
+
 namespace folly {
 PollIoBackend::TimerEntry::TimerEntry(
     Event* event,
@@ -39,11 +120,28 @@ PollIoBackend::TimerEntry::TimerEntry(
   setExpireTime(timeout);
 }
 
-PollIoBackend::PollIoBackend(size_t capacity, size_t maxSubmit, size_t maxGet)
-    : capacity_(capacity),
-      numEntries_(capacity),
-      maxSubmit_(maxSubmit),
-      maxGet_(maxGet) {
+PollIoBackend::SocketPair::SocketPair() {
+  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds_.data())) {
+    throw std::runtime_error("socketpair error");
+  }
+
+  // set the sockets to non blocking mode
+  for (auto fd : fds_) {
+    auto flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  }
+}
+
+PollIoBackend::SocketPair::~SocketPair() {
+  for (auto fd : fds_) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+}
+
+PollIoBackend::PollIoBackend(Options options)
+    : options_(options), numEntries_(options.capacity) {
   // create the timer fd
   timerFd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   if (timerFd_ < 0) {
@@ -52,13 +150,25 @@ PollIoBackend::PollIoBackend(size_t capacity, size_t maxSubmit, size_t maxGet)
 }
 
 PollIoBackend::~PollIoBackend() {
+  CHECK(!timerEntry_);
+  CHECK(!signalReadEntry_);
+  CHECK(freeList_.empty());
+
   ::close(timerFd_);
 }
 
 bool PollIoBackend::addTimerFd() {
   auto* entry = allocSubmissionEntry(); // this can be nullptr
   timerEntry_->prepPollAdd(entry, timerFd_, POLLIN, true /*registerFd*/);
-  return (1 == submitOne(timerEntry_));
+  return (1 == submitOne(timerEntry_.get()));
+}
+
+bool PollIoBackend::addSignalFds() {
+  auto* entry = allocSubmissionEntry(); // this can be nullptr
+  signalReadEntry_->prepPollAdd(
+      entry, signalFds_.readFd(), POLLIN, false /*registerFd*/);
+
+  return (1 == submitOne(signalReadEntry_.get()));
 }
 
 void PollIoBackend::scheduleTimeout() {
@@ -78,7 +188,9 @@ void PollIoBackend::scheduleTimeout() {
     scheduleTimeout(std::chrono::microseconds(0)); // disable
   }
 
-  addTimerFd();
+  // we do not call addTimerFd() here
+  // since it has to be added only once, after
+  // we process a poll callback
 }
 
 void PollIoBackend::scheduleTimeout(const std::chrono::microseconds& us) {
@@ -176,17 +288,67 @@ size_t PollIoBackend::processTimers() {
   return ret;
 }
 
-PollIoBackend::IoCb* PollIoBackend::allocIoCb() {
+void PollIoBackend::addSignalEvent(Event& event) {
+  auto* ev = event.getEvent();
+  signals_[ev->ev_fd].insert(&event);
+
+  // we pass the write fd for notifications
+  sSignalRegistry.setNotifyFd(ev->ev_fd, signalFds_.writeFd());
+}
+
+void PollIoBackend::removeSignalEvent(Event& event) {
+  auto* ev = event.getEvent();
+  auto iter = signals_.find(ev->ev_fd);
+  if (iter != signals_.end()) {
+    sSignalRegistry.setNotifyFd(ev->ev_fd, -1);
+  }
+}
+
+size_t PollIoBackend::processSignals() {
+  size_t ret = 0;
+  static constexpr auto kNumEntries = NSIG * 2;
+  static_assert(
+      NSIG < 256, "Use a different data type to cover all the signal values");
+  std::array<bool, NSIG> processed{};
+  std::array<uint8_t, kNumEntries> signals;
+
+  ssize_t num =
+      folly::readNoInt(signalFds_.readFd(), signals.data(), signals.size());
+  for (ssize_t i = 0; i < num; i++) {
+    int signum = static_cast<int>(signals[i]);
+    if ((signum >= 0) && (signum < static_cast<int>(processed.size())) &&
+        !processed[signum]) {
+      processed[signum] = true;
+      auto iter = signals_.find(signum);
+      if (iter != signals_.end()) {
+        auto& set = iter->second;
+        for (auto& event : set) {
+          auto* ev = event->getEvent();
+          ev->ev_res = 0;
+          event_ref_flags(ev) |= EVLIST_ACTIVE;
+          (*event_ref_callback(ev))(
+              (int)ev->ev_fd, ev->ev_res, event_ref_arg(ev));
+          event_ref_flags(ev) &= ~EVLIST_ACTIVE;
+        }
+      }
+    }
+  }
+  // add the signal fd(s) back
+  addSignalFds();
+  return ret;
+}
+
+PollIoBackend::IoCb* PollIoBackend::allocIoCb(const EventCallback& cb) {
   // try to allocate from the pool first
-  if (FOLLY_LIKELY(freeHead_ != nullptr)) {
-    auto* ret = freeHead_;
-    freeHead_ = freeHead_->next_;
+  if ((cb.type_ == EventCallback::Type::TYPE_NONE) && (!freeList_.empty())) {
+    auto* ret = &freeList_.front();
+    freeList_.pop_front();
     numIoCbInUse_++;
     return ret;
   }
 
   // alloc a new IoCb
-  auto* ret = allocNewIoCb();
+  auto* ret = allocNewIoCb(cb);
   if (FOLLY_LIKELY(!!ret)) {
     numIoCbInUse_++;
   }
@@ -195,7 +357,8 @@ PollIoBackend::IoCb* PollIoBackend::allocIoCb() {
 }
 
 void PollIoBackend::releaseIoCb(PollIoBackend::IoCb* aioIoCb) {
-  numIoCbInUse_--;
+  CHECK_GT(numIoCbInUse_, 0);
+  aioIoCb->cbData_.releaseData();
   // unregister the file descriptor record
   if (aioIoCb->fdRecord_) {
     unregisterFd(aioIoCb->fdRecord_);
@@ -203,11 +366,14 @@ void PollIoBackend::releaseIoCb(PollIoBackend::IoCb* aioIoCb) {
   }
 
   if (FOLLY_LIKELY(aioIoCb->poolAlloc_)) {
+    numIoCbInUse_--;
     aioIoCb->event_ = nullptr;
-    aioIoCb->next_ = freeHead_;
-    freeHead_ = aioIoCb;
+    freeList_.push_front(*aioIoCb);
   } else {
-    delete aioIoCb;
+    if (!aioIoCb->persist_) {
+      numIoCbInUse_--;
+      delete aioIoCb;
+    }
   }
 }
 
@@ -227,7 +393,7 @@ void PollIoBackend::processPollIo(IoCb* ioCb, int64_t res) noexcept {
 
     // add it to the active list
     event_ref_flags(ev) |= EVLIST_ACTIVE;
-    ev->ev_res = getPollEvents(res, ev->ev_events);
+    ev->ev_res = res;
     activeEvents_.push_back(*ioCb);
   } else {
     releaseIoCb(ioCb);
@@ -252,7 +418,16 @@ size_t PollIoBackend::processActiveEvents() {
 
       // prevent the callback from freeing the aioIoCb
       ioCb->useCount_++;
-      (*event_ref_callback(ev))((int)ev->ev_fd, ev->ev_res, event_ref_arg(ev));
+      if (!ioCb->cbData_.processCb(ev->ev_res)) {
+        // adjust the ev_res for the poll case
+        ev->ev_res = getPollEvents(ev->ev_res, ev->ev_events);
+        // handle spurious poll events that return 0
+        // this can happen during high load on process startup
+        if (ev->ev_res) {
+          (*event_ref_callback(ev))(
+              (int)ev->ev_fd, ev->ev_res, event_ref_arg(ev));
+        }
+      }
       // get the event again
       event = ioCb->event_;
       ev = event ? event->getEvent() : nullptr;
@@ -262,6 +437,8 @@ size_t PollIoBackend::processActiveEvents() {
         eb_event_modify_inserted(*event, ioCb);
       }
       ioCb->useCount_--;
+    } else {
+      ioCb->processActive();
     }
     if (release) {
       releaseIoCb(ioCb);
@@ -286,7 +463,7 @@ int PollIoBackend::eb_event_base_loop(int flags) {
 
     submitList(submitList_, waitForEvents);
 
-    if (!numInsertedEvents_ && timers_.empty()) {
+    if (!numInsertedEvents_ && timers_.empty() && signals_.empty()) {
       return 1;
     }
 
@@ -304,9 +481,20 @@ int PollIoBackend::eb_event_base_loop(int flags) {
 
     size_t numProcessedTimers = 0;
 
+    // save the processTimers_
+    // this means we've received a notification
+    // and we need to add the timer fd back
+    bool processTimersFlag = processTimers_;
     if (processTimers_ && !loopBreak_) {
       numProcessedTimers = processTimers();
       processTimers_ = false;
+    }
+
+    size_t numProcessedSignals = 0;
+
+    if (processSignals_ && !loopBreak_) {
+      numProcessedSignals = processSignals();
+      processSignals_ = false;
     }
 
     if (!activeEvents_.empty() && !loopBreak_) {
@@ -315,11 +503,18 @@ int PollIoBackend::eb_event_base_loop(int flags) {
         done = true;
       }
     } else if (flags & EVLOOP_NONBLOCK) {
+      if (signals_.empty()) {
+        done = true;
+      }
+    }
+
+    if (!done && (numProcessedTimers || numProcessedSignals) &&
+        (flags & EVLOOP_ONCE)) {
       done = true;
     }
 
-    if (!done && numProcessedTimers && (flags & EVLOOP_ONCE)) {
-      done = true;
+    if (processTimersFlag) {
+      addTimerFd();
     }
   }
 
@@ -343,48 +538,28 @@ int PollIoBackend::eb_event_add(Event& event, const struct timeval* timeout) {
     return 0;
   }
 
-  // TBD - signal later
-  if ((ev->ev_events & (EV_READ | EV_WRITE | EV_SIGNAL)) &&
+  if (ev->ev_events & EV_SIGNAL) {
+    event_ref_flags(ev) |= EVLIST_INSERTED;
+    addSignalEvent(event);
+    return 0;
+  }
+
+  if ((ev->ev_events & (EV_READ | EV_WRITE)) &&
       !(event_ref_flags(ev) & (EVLIST_INSERTED | EVLIST_ACTIVE))) {
-    auto* iocb = allocIoCb();
+    auto* iocb = allocIoCb(event.getCallback());
     CHECK(iocb);
     iocb->event_ = &event;
 
-    if (maxSubmit_) {
-      // just append it
-      submitList_.push_back(*iocb);
-      if (~event_ref_flags(ev) & EVLIST_INTERNAL) {
-        numInsertedEvents_++;
-      }
-      event_ref_flags(ev) |= EVLIST_INSERTED;
-      event.setUserData(iocb);
-
-      return 0;
-    } else {
-      auto* entry = allocSubmissionEntry(); // this can be nullptr
-      iocb->prepPollAdd(
-          entry,
-          ev->ev_fd,
-          getPollFlags(ev->ev_events),
-          (ev->ev_events & EV_PERSIST) != 0);
-      int ret = submitOne(iocb);
-      if (ret == 1) {
-        if (~event_ref_flags(ev) & EVLIST_INTERNAL) {
-          numInsertedEvents_++;
-        }
-        event_ref_flags(ev) |= EVLIST_INSERTED;
-        event.setUserData(iocb);
-      } else {
-        releaseIoCb(iocb);
-      }
-      if (ret != 1) {
-        throw std::runtime_error("io_submit error");
-      }
-      return (ret == 1) ? 0 : -1;
+    // just append it
+    submitList_.push_back(*iocb);
+    if (~event_ref_flags(ev) & EVLIST_INTERNAL) {
+      numInsertedEvents_++;
     }
+    event_ref_flags(ev) |= EVLIST_INSERTED;
+    event.setUserData(iocb);
   }
 
-  return -1;
+  return 0;
 }
 
 int PollIoBackend::eb_event_del(Event& event) {
@@ -401,6 +576,12 @@ int PollIoBackend::eb_event_del(Event& event) {
 
   if (!(event_ref_flags(ev) & (EVLIST_ACTIVE | EVLIST_INSERTED))) {
     return -1;
+  }
+
+  if (ev->ev_events & EV_SIGNAL) {
+    event_ref_flags(ev) &= ~(EVLIST_INSERTED | EVLIST_ACTIVE);
+    removeSignalEvent(event);
+    return 0;
   }
 
   auto* iocb = reinterpret_cast<IoCb*>(event.getUserData());

@@ -217,7 +217,7 @@ void LoggerDB::startConfigUpdate(
 
     LogHandlerConfig updatedConfig;
     const LogHandlerConfig* handlerConfig;
-    if (entry.second.type.hasValue()) {
+    if (entry.second.type.has_value()) {
       handlerConfig = &entry.second;
     } else {
       // This configuration is intended to update an existing LogHandler
@@ -227,7 +227,7 @@ void LoggerDB::startConfigUpdate(
       }
 
       updatedConfig = oldHandler->getConfig();
-      if (!updatedConfig.type.hasValue()) {
+      if (!updatedConfig.type.has_value()) {
         // This normally should not happen unless someone improperly manually
         // constructed a LogHandler object.  All existing LogHandler objects
         // should indicate their type.
@@ -260,7 +260,7 @@ void LoggerDB::startConfigUpdate(
         handler = factory->createHandler(handlerConfig->options);
       }
     } catch (const std::exception& ex) {
-      // Errors creating or updating the the log handler are generally due to
+      // Errors creating or updating the log handler are generally due to
       // bad configuration options.  It is useful to update the exception
       // message to include the name of the log handler we were trying to
       // update or create.
@@ -279,7 +279,7 @@ void LoggerDB::startConfigUpdate(
   // Before we start making any LogCategory changes, confirm that all handlers
   // named in the category configs are known handlers.
   for (const auto& entry : config.getCategoryConfigs()) {
-    if (!entry.second.handlers.hasValue()) {
+    if (!entry.second.handlers.has_value()) {
       continue;
     }
     for (const auto& handlerName : entry.second.handlers.value()) {
@@ -374,7 +374,7 @@ void LoggerDB::updateConfig(const LogConfig& config) {
         getOrCreateCategoryLocked(*loggersByName, entry.first);
 
     // Update the log handlers
-    if (entry.second.handlers.hasValue()) {
+    if (entry.second.handlers.has_value()) {
       auto catHandlers = buildCategoryHandlerList(
           handlers, entry.first, entry.second.handlers.value());
       category->replaceHandlers(std::move(catHandlers));
@@ -442,7 +442,7 @@ void LoggerDB::resetConfig(const LogConfig& config) {
       // If the handler list is not set in the config, clear out any existing
       // handlers rather than leaving it as-is.
       std::vector<std::shared_ptr<LogHandler>> catHandlers;
-      if (catConfig.handlers.hasValue()) {
+      if (catConfig.handlers.has_value()) {
         catHandlers = buildCategoryHandlerList(
             handlers, entry.first, catConfig.handlers.value());
       }
@@ -597,6 +597,90 @@ LogCategory* LoggerDB::xlogInitCategory(
   *xlogCategory = category;
   isInitialized->store(true, std::memory_order_release);
   return category;
+}
+
+class LoggerDB::ContextCallbackList::CallbacksObj {
+  using StorageBlock = std::array<ContextCallback, 16>;
+
+ public:
+  CallbacksObj() : end_(block_.begin()) {}
+
+  template <typename F>
+  void forEach(F&& f) const {
+    auto end = end_.load(std::memory_order_acquire);
+
+    for (auto it = block_.begin(); it != end; it = std::next(it)) {
+      f(*it);
+    }
+  }
+
+  /**
+   * Callback list is implemented as an unsynchronized array, so an atomic
+   * end flag is used for list readers to get a synchronized view of the
+   * list with concurrent writers, protecting the underlying array.
+   * There can be also race condition between list writers, because the end
+   * flag is firstly tested before written, which should be serialized with
+   * another global mutex to prevent TOCTOU bug.
+   */
+  void push(ContextCallback callback) {
+    auto end = end_.load(std::memory_order_relaxed);
+    if (end == block_.end()) {
+      folly::throw_exception(std::length_error(
+          "Exceeding limit for the number of pushed context callbacks."));
+    }
+    *end = std::move(callback);
+    end_.store(std::next(end), std::memory_order_release);
+  }
+
+ private:
+  StorageBlock block_;
+  std::atomic<StorageBlock::iterator> end_;
+};
+
+LoggerDB::ContextCallbackList::~ContextCallbackList() {
+  auto callback = callbacks_.load(std::memory_order_relaxed);
+  if (callback != nullptr) {
+    delete callback;
+  }
+}
+
+void LoggerDB::ContextCallbackList::addCallback(ContextCallback callback) {
+  std::lock_guard<std::mutex> g(writeMutex_);
+  auto callbacks = callbacks_.load(std::memory_order_relaxed);
+  if (!callbacks) {
+    callbacks = new CallbacksObj();
+    callbacks_.store(callbacks, std::memory_order_relaxed);
+  }
+  callbacks->push(std::move(callback));
+}
+
+std::string LoggerDB::ContextCallbackList::getContextString() const {
+  auto callbacks = callbacks_.load(std::memory_order_relaxed);
+  if (callbacks == nullptr) {
+    return {};
+  }
+
+  std::string ret;
+  callbacks->forEach([&](const auto& callback) {
+    try {
+      auto ctx = callback();
+      if (ctx.empty()) {
+        return;
+      }
+      folly::toAppend(' ', std::move(ctx), &ret);
+    } catch (const std::exception& e) {
+      folly::toAppend("[error:", folly::exceptionStr(e), "]", &ret);
+    };
+  });
+  return ret;
+}
+
+void LoggerDB::addContextCallback(ContextCallback callback) {
+  contextCallbacks_.addCallback(std::move(callback));
+}
+
+std::string LoggerDB::getContextString() const {
+  return contextCallbacks_.getContextString();
 }
 
 std::atomic<LoggerDB::InternalWarningHandler> LoggerDB::warningHandler_;

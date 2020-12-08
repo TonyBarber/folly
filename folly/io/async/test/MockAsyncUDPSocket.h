@@ -27,7 +27,9 @@ struct MockAsyncUDPSocket : public AsyncUDPSocket {
   ~MockAsyncUDPSocket() override {}
 
   MOCK_CONST_METHOD0(address, const SocketAddress&());
-  MOCK_METHOD1(bind, void(const SocketAddress&));
+  MOCK_METHOD2(
+      bind,
+      void(const SocketAddress&, AsyncUDPSocket::BindOptions bindOptions));
   MOCK_METHOD2(setFD, void(NetworkSocket, AsyncUDPSocket::FDOwnership));
   MOCK_METHOD2(
       write,
@@ -50,11 +52,14 @@ struct MockAsyncUDPSocket : public AsyncUDPSocket {
   MOCK_METHOD1(setReuseAddr, void(bool));
   MOCK_METHOD1(dontFragment, void(bool));
   MOCK_METHOD1(setErrMessageCallback, void(ErrMessageCallback*));
-  MOCK_METHOD1(connect, int(const SocketAddress&));
+  MOCK_METHOD1(connect, void(const SocketAddress&));
   MOCK_CONST_METHOD0(isBound, bool());
   MOCK_METHOD0(getGSO, int());
   MOCK_METHOD1(setGSO, bool(int));
   MOCK_METHOD2(recvmsg, ssize_t(struct msghdr*, int));
+  MOCK_METHOD4(
+      recvmmsg,
+      int(struct mmsghdr*, unsigned int, unsigned int, struct timespec*));
 };
 
 } // namespace test

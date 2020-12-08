@@ -19,6 +19,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,6 +30,7 @@
 #include <folly/Random.h>
 #include <folly/portability/Asm.h>
 #include <folly/portability/GFlags.h>
+#include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <folly/portability/PThread.h>
 #include <folly/portability/Unistd.h>
@@ -85,10 +87,7 @@ void splock_test() {
     folly::asm_volatile_pause();
     MSLGuard g(v.lock);
 
-    int first = v.ar[0];
-    for (size_t j = 1; j < sizeof v.ar / sizeof j; ++j) {
-      EXPECT_EQ(first, v.ar[j]);
-    }
+    EXPECT_THAT(v.ar, testing::Each(testing::Eq(v.ar[0])));
 
     int byte = folly::Random::rand32(rng);
     memset(v.ar, char(byte), sizeof v.ar);
@@ -100,9 +99,7 @@ template <class T>
 struct PslTest {
   PicoSpinLock<T> lock;
 
-  PslTest() {
-    lock.init();
-  }
+  PslTest() { lock.init(); }
 
   void doTest() {
     using UT = typename std::make_unsigned<T>::type;
@@ -134,9 +131,7 @@ void doPslTest() {
 #endif
 
 struct TestClobber {
-  TestClobber() {
-    lock_.init();
-  }
+  TestClobber() { lock_.init(); }
 
   void go() {
     std::lock_guard<MicroSpinLock> g(lock_);
@@ -206,7 +201,12 @@ TEST(SmallLocks, PicoSpinLockThreadSanitizer) {
     {
       std::lock_guard<Lock> gb(b);
       EXPECT_DEATH(
-          [&]() { std::lock_guard<Lock> ga(a); }(),
+          [&]() {
+            std::lock_guard<Lock> ga(a);
+            // If halt_on_error is turned off for TSAN, then death would
+            // happen on exit, so give that a chance as well.
+            std::_Exit(1);
+          }(),
           "Cycle in lock order graph");
     }
   }
@@ -385,9 +385,7 @@ class MutexWrapper {
     while (!mutex_.try_lock()) {
     }
   }
-  void unlock() {
-    mutex_.unlock();
-  }
+  void unlock() { mutex_.unlock(); }
 
   Mutex mutex_;
 };
@@ -433,7 +431,12 @@ TEST(SmallLocksk, MicroSpinLockThreadSanitizer) {
     {
       std::lock_guard<MicroSpinLock> gb(b);
       EXPECT_DEATH(
-          [&]() { std::lock_guard<MicroSpinLock> ga(a); }(),
+          [&]() {
+            std::lock_guard<MicroSpinLock> ga(a);
+            // If halt_on_error is turned off for TSAN, then death would
+            // happen on exit, so give that a chance as well.
+            std::_Exit(1);
+          }(),
           "Cycle in lock order graph");
     }
   }
@@ -454,6 +457,9 @@ TEST(SmallLocksk, MicroSpinLockThreadSanitizer) {
           [&]() {
             std::lock_guard<MicroSpinLock> ga(
                 *reinterpret_cast<MicroSpinLock*>(&a));
+            // If halt_on_error is turned off for TSAN, then death would
+            // happen on exit, so give that a chance as well.
+            std::_Exit(1);
           }(),
           "Cycle in lock order graph");
     }

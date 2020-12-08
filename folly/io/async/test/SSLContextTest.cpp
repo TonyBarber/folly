@@ -22,7 +22,6 @@
 #include <folly/io/async/test/SSLUtil.h>
 
 using namespace std;
-using namespace testing;
 
 namespace folly {
 
@@ -180,4 +179,30 @@ TEST_F(SSLContextTest, TestLoadCertificateChain) {
   EXPECT_EQ(1, sk_X509_num(stack));
 }
 
+TEST_F(SSLContextTest, TestGetFromSSLCtx) {
+  // Positive test
+  SSLContext* contextPtr = SSLContext::getFromSSLCtx(ctx.getSSLCtx());
+  EXPECT_EQ(contextPtr, &ctx);
+
+  // Negative test
+  SSL_CTX* randomCtx = SSL_CTX_new(SSLv23_method());
+  EXPECT_EQ(nullptr, SSLContext::getFromSSLCtx(randomCtx));
+  SSL_CTX_free(randomCtx);
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x1000200fL
+TEST_F(SSLContextTest, TestInvalidSigAlgThrows) {
+  {
+    SSLContext tmpCtx;
+    EXPECT_THROW(tmpCtx.setSigAlgsOrThrow(""), std::runtime_error);
+  }
+
+  {
+    SSLContext tmpCtx;
+    EXPECT_THROW(
+        tmpCtx.setSigAlgsOrThrow("rsa_pss_rsae_sha512:ECDSA+SHA256:RSA+HA256"),
+        std::runtime_error);
+  }
+}
+#endif
 } // namespace folly

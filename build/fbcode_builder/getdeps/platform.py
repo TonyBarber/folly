@@ -11,8 +11,8 @@ import sys
 
 
 def is_windows():
-    """ Returns true if the system we are currently running on
-    is a Windows system """
+    """Returns true if the system we are currently running on
+    is a Windows system"""
     return sys.platform.startswith("win")
 
 
@@ -42,7 +42,11 @@ def get_linux_type():
         name = re.sub("linux", "", name)
         name = name.strip()
 
-    return "linux", name, os_vars.get("VERSION_ID").lower()
+    version_id = os_vars.get("VERSION_ID")
+    if version_id:
+        version_id = version_id.lower()
+
+    return "linux", name, version_id
 
 
 class HostType(object):
@@ -82,6 +86,15 @@ class HostType(object):
             self.distro or "none",
             self.distrovers or "none",
         )
+
+    def get_package_manager(self):
+        if not self.is_linux():
+            return None
+        if self.distro in ("fedora", "centos"):
+            return "rpm"
+        if self.distro in ("debian", "ubuntu"):
+            return "deb"
+        return None
 
     @staticmethod
     def from_tuple_string(s):

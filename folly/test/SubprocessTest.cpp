@@ -188,6 +188,15 @@ TEST(SimpleSubprocessTest, waitOrTerminateOrKill_terminates_if_timeout) {
   EXPECT_EQ(SIGTERM, retCode.killSignal());
 }
 
+TEST(
+    SimpleSubprocessTest,
+    destructor_doesNotFail_ifOkToDestroyWhileProcessRunning) {
+  Subprocess proc(
+      std::vector<std::string>{"/bin/sleep", "10"},
+      Subprocess::Options().allowDestructionWhileProcessRunning(true));
+  proc.~Subprocess();
+}
+
 // This method verifies terminateOrKill shouldn't affect the exit
 // status if the process has exitted already.
 TEST(SimpleSubprocessTest, TerminateAfterProcessExit) {
@@ -336,6 +345,25 @@ TEST(SimpleSubprocessTest, DetachExecFails) {
       "failed to execute /no/such/file:",
       Subprocess::Options().detach(),
       "/no/such/file");
+}
+
+TEST(SimpleSubprocessTest, FromExistingProcess) {
+  // Manually fork a child process using fork() without exec(), and test waiting
+  // for it using the Subprocess API in the parent process.
+  static int constexpr kReturnCode = 123;
+
+  auto pid = fork();
+  ASSERT_NE(pid, -1) << "fork failed";
+  if (pid == 0) {
+    // child process
+    _exit(kReturnCode);
+  }
+
+  auto child = Subprocess::fromExistingProcess(pid);
+  EXPECT_TRUE(child.returnCode().running());
+  auto retCode = child.wait();
+  EXPECT_TRUE(retCode.exited());
+  EXPECT_EQ(kReturnCode, retCode.exitStatus());
 }
 
 TEST(ParentDeathSubprocessTest, ParentDeathSignal) {

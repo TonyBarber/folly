@@ -50,7 +50,7 @@ TEST_F(MergeTest, SimpleMerge) {
           co_yield makeGenerator(3, 2);
         }());
 
-    const std::array<int, 5> expectedValues = {0, 3, 1, 4, 2};
+    const std::array<int, 5> expectedValues = {{0, 3, 1, 4, 2}};
 
     auto item = co_await generator.next();
     for (int expectedValue : expectedValues) {
@@ -72,9 +72,7 @@ TEST_F(MergeTest, TruncateStream) {
           co_invoke([&]() -> AsyncGenerator<AsyncGenerator<int>> {
             auto makeGenerator = [&]() -> AsyncGenerator<int> {
               ++started;
-              SCOPE_EXIT {
-                ++completed;
-              };
+              SCOPE_EXIT { ++completed; };
               co_yield 1;
               co_await co_reschedule_on_current_executor;
               co_yield 2;

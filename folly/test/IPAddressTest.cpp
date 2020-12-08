@@ -79,21 +79,11 @@ struct AddressFlags {
   AddressFlags(const std::string& addr, uint8_t version_, uint8_t flags_)
       : address(addr), flags(flags_), version(version_) {}
 
-  bool isLoopback() const {
-    return (flags & IS_LOCAL);
-  }
-  bool isNonroutable() const {
-    return (flags & IS_NONROUTABLE);
-  }
-  bool isPrivate() const {
-    return (flags & IS_PRIVATE);
-  }
-  bool isZero() const {
-    return (flags & IS_ZERO);
-  }
-  bool isLinkLocal() const {
-    return (flags & IS_LINK_LOCAL);
-  }
+  bool isLoopback() const { return (flags & IS_LOCAL); }
+  bool isNonroutable() const { return (flags & IS_NONROUTABLE); }
+  bool isPrivate() const { return (flags & IS_PRIVATE); }
+  bool isZero() const { return (flags & IS_ZERO); }
+  bool isLinkLocal() const { return (flags & IS_LINK_LOCAL); }
   bool isLinkLocalBroadcast() const {
     return (flags & IS_LINK_LOCAL_BROADCAST);
   }
@@ -1249,33 +1239,33 @@ TEST(IPAddress, StringFormat) {
 
 TEST(IPAddress, getMacAddressFromLinkLocal) {
   IPAddressV6 ip6("fe80::f652:14ff:fec5:74d8");
-  EXPECT_TRUE(ip6.getMacAddressFromLinkLocal().hasValue());
+  EXPECT_TRUE(ip6.getMacAddressFromLinkLocal().has_value());
   EXPECT_EQ("f4:52:14:c5:74:d8", ip6.getMacAddressFromLinkLocal()->toString());
 }
 
 TEST(IPAddress, getMacAddressFromLinkLocal_Negative) {
   IPAddressV6 no_link_local_ip6("2803:6082:a2:4447::1");
-  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().hasValue());
+  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().has_value());
   no_link_local_ip6 = IPAddressV6("fe80::f652:14ff:ccc5:74d8");
-  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().hasValue());
+  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().has_value());
   no_link_local_ip6 = IPAddressV6("fe80::f652:14ff:ffc5:74d8");
-  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().hasValue());
+  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().has_value());
   no_link_local_ip6 = IPAddressV6("fe81::f652:14ff:ffc5:74d8");
-  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().hasValue());
+  EXPECT_FALSE(no_link_local_ip6.getMacAddressFromLinkLocal().has_value());
 }
 
 TEST(IPAddress, getMacAddressFromEUI64) {
   IPAddressV6 ip6("2401:db00:3020:51dc:4a57:ddff:fe04:5643");
-  EXPECT_TRUE(ip6.getMacAddressFromEUI64().hasValue());
+  EXPECT_TRUE(ip6.getMacAddressFromEUI64().has_value());
   EXPECT_EQ("48:57:dd:04:56:43", ip6.getMacAddressFromEUI64()->toString());
   ip6 = IPAddressV6("fe80::4a57:ddff:fe04:5643");
-  EXPECT_TRUE(ip6.getMacAddressFromEUI64().hasValue());
+  EXPECT_TRUE(ip6.getMacAddressFromEUI64().has_value());
   EXPECT_EQ("48:57:dd:04:56:43", ip6.getMacAddressFromEUI64()->toString());
 }
 
 TEST(IPAddress, getMacAddressFromEUI64_Negative) {
   IPAddressV6 not_eui64_ip6("2401:db00:3020:51dc:face:0000:009a:0000");
-  EXPECT_FALSE(not_eui64_ip6.getMacAddressFromEUI64().hasValue());
+  EXPECT_FALSE(not_eui64_ip6.getMacAddressFromEUI64().has_value());
 }
 
 TEST(IPAddress, LongestCommonPrefix) {

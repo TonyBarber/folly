@@ -28,12 +28,16 @@
 
 #include <folly/ConstexprMath.h>
 #include <folly/SingletonThreadLocal.h>
+#include <folly/portability/Config.h>
 #include <folly/portability/SysSyscall.h>
 #include <folly/portability/Unistd.h>
+#include <folly/synchronization/SanitizeThread.h>
 
 #ifdef FOLLY_SANITIZE_ADDRESS
 
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 
 static void __sanitizer_start_switch_fiber_weak(
     void** fake_stack_save,
@@ -78,19 +82,20 @@ struct hash<folly::fibers::FiberManager::Options> {
 namespace folly {
 namespace fibers {
 
-FOLLY_TLS FiberManager* FiberManager::currentFiberManager_ = nullptr;
-
 auto FiberManager::FrozenOptions::create(const Options& options) -> ssize_t {
   return std::hash<Options>()(options);
+}
+
+/* static */ FiberManager*& FiberManager::getCurrentFiberManager() {
+  struct Tag {};
+  folly::annotate_ignore_thread_sanitizer_guard g(__FILE__, __LINE__);
+  return SingletonThreadLocal<FiberManager*, Tag>::get();
 }
 
 FiberManager::FiberManager(
     std::unique_ptr<LoopController> loopController,
     Options options)
-    : FiberManager(
-          LocalType<void>(),
-          std::move(loopController),
-          std::move(options)) {}
+    : FiberManager(LocalType<void>(), std::move(loopController), options) {}
 
 FiberManager::~FiberManager() {
   loopController_.reset();
@@ -125,12 +130,13 @@ Fiber* FiberManager::getFiber() {
 
   if (fibersPool_.empty()) {
     fiber = new Fiber(*this);
-    ++fibersAllocated_;
+    fibersAllocated_.store(fibersAllocated() + 1, std::memory_order_relaxed);
   } else {
     fiber = &fibersPool_.front();
     fibersPool_.pop_front();
-    assert(fibersPoolSize_ > 0);
-    --fibersPoolSize_;
+    auto fibersPoolSize = fibersPoolSize_.load(std::memory_order_relaxed);
+    assert(fibersPoolSize > 0);
+    fibersPoolSize_.store(fibersPoolSize - 1, std::memory_order_relaxed);
   }
   assert(fiber);
   if (++fibersActive_ > maxFibersActiveLastPeriod_) {
@@ -149,15 +155,15 @@ void FiberManager::setExceptionCallback(FiberManager::ExceptionCallback ec) {
 }
 
 size_t FiberManager::fibersAllocated() const {
-  return fibersAllocated_;
+  return fibersAllocated_.load(std::memory_order_relaxed);
 }
 
 size_t FiberManager::fibersPoolSize() const {
-  return fibersPoolSize_;
+  return fibersPoolSize_.load(std::memory_order_relaxed);
 }
 
 size_t FiberManager::stackHighWatermark() const {
-  return stackHighWatermark_;
+  return stackHighWatermark_.load(std::memory_order_relaxed);
 }
 
 void FiberManager::remoteReadyInsert(Fiber* fiber) {
@@ -182,14 +188,19 @@ void FiberManager::setPreemptRunner(InlineFunctionRunner* preemptRunner) {
 }
 
 void FiberManager::doFibersPoolResizing() {
-  while (fibersAllocated_ > maxFibersActiveLastPeriod_ &&
-         fibersPoolSize_ > options_.maxFibersPoolSize) {
+  while (true) {
+    auto fibersAllocated = this->fibersAllocated();
+    auto fibersPoolSize = this->fibersPoolSize();
+    if (!(fibersAllocated > maxFibersActiveLastPeriod_ &&
+          fibersPoolSize > options_.maxFibersPoolSize)) {
+      break;
+    }
     auto fiber = &fibersPool_.front();
     assert(fiber != nullptr);
     fibersPool_.pop_front();
     delete fiber;
-    --fibersPoolSize_;
-    --fibersAllocated_;
+    fibersPoolSize_.store(fibersPoolSize - 1, std::memory_order_relaxed);
+    fibersAllocated_.store(fibersAllocated - 1, std::memory_order_relaxed);
   }
 
   maxFibersActiveLastPeriod_ = fibersActive_;
@@ -197,10 +208,13 @@ void FiberManager::doFibersPoolResizing() {
 
 void FiberManager::FibersPoolResizer::run() {
   fiberManager_.doFibersPoolResizing();
-  fiberManager_.loopController_->timer().scheduleTimeout(
-      this,
-      std::chrono::milliseconds(
-          fiberManager_.options_.fibersPoolResizePeriodMs));
+  if (auto timer = fiberManager_.loopController_->timer()) {
+    RequestContextScopeGuard rctxGuard(std::shared_ptr<RequestContext>{});
+    timer->scheduleTimeout(
+        this,
+        std::chrono::milliseconds(
+            fiberManager_.options_.fibersPoolResizePeriodMs));
+  }
 }
 
 #ifdef FOLLY_SANITIZE_ADDRESS
@@ -268,11 +282,13 @@ static AsanStartSwitchStackFuncPtr getStartSwitchStackFunc() {
   }
 
   // Check whether we can find a dynamically linked enter function
+#ifndef _WIN32
   if (nullptr !=
       (fn = (AsanStartSwitchStackFuncPtr)dlsym(
            RTLD_DEFAULT, "__sanitizer_start_switch_fiber"))) {
     return fn;
   }
+#endif
 
   // Couldn't find the function at all
   return nullptr;
@@ -287,11 +303,13 @@ static AsanFinishSwitchStackFuncPtr getFinishSwitchStackFunc() {
   }
 
   // Check whether we can find a dynamically linked exit function
+#ifndef _WIN32
   if (nullptr !=
       (fn = (AsanFinishSwitchStackFuncPtr)dlsym(
            RTLD_DEFAULT, "__sanitizer_finish_switch_fiber"))) {
     return fn;
   }
+#endif
 
   // Couldn't find the function at all
   return nullptr;
@@ -306,11 +324,13 @@ static AsanUnpoisonMemoryRegionFuncPtr getUnpoisonMemoryRegionFunc() {
   }
 
   // Check whether we can find a dynamically linked unpoison function
+#ifndef _WIN32
   if (nullptr !=
       (fn = (AsanUnpoisonMemoryRegionFuncPtr)dlsym(
            RTLD_DEFAULT, "__asan_unpoison_memory_region"))) {
     return fn;
   }
+#endif
 
   // Couldn't find the function at all
   return nullptr;
@@ -318,7 +338,9 @@ static AsanUnpoisonMemoryRegionFuncPtr getUnpoisonMemoryRegionFunc() {
 
 #endif // FOLLY_SANITIZE_ADDRESS
 
-#ifndef _WIN32
+// TVOS and WatchOS platforms have SIGSTKSZ but not sigaltstack
+#if defined(SIGSTKSZ) && !FOLLY_APPLE_TVOS && !FOLLY_APPLE_WATCHOS
+
 namespace {
 
 // SIGSTKSZ (8 kB on our architectures) isn't always enough for
@@ -372,11 +394,19 @@ class ScopedAlternateSignalStack {
 };
 } // namespace
 
-void FiberManager::registerAlternateSignalStack() {
+void FiberManager::maybeRegisterAlternateSignalStack() {
   SingletonThreadLocal<ScopedAlternateSignalStack>::get();
 
   alternateSignalStackRegistered_ = true;
 }
+
+#else
+
+void FiberManager::maybeRegisterAlternateSignalStack() {
+  // no-op
+}
+
 #endif
+
 } // namespace fibers
 } // namespace folly

@@ -247,25 +247,27 @@ struct transparent : T {
  * Example:
  *
  *   int i = 42;
- *   int &j = Identity()(i);
+ *   int &j = identity(i);
  *   assert(&i == &j);
  *
- * Warning: passing a prvalue through Identity turns it into an xvalue,
+ * Warning: passing a prvalue through identity turns it into an xvalue,
  * which can effect whether lifetime extension occurs or not. For instance:
  *
  *   auto&& x = std::make_unique<int>(42);
  *   cout << *x ; // OK, x refers to a valid unique_ptr.
  *
- *   auto&& y = Identity()(std::make_unique<int>(42));
+ *   auto&& y = identity(std::make_unique<int>(42));
  *   cout << *y ; // ERROR: y did not lifetime-extend the unique_ptr. It
  *                // is no longer valid
  */
-struct Identity {
+struct identity_fn {
   template <class T>
   constexpr T&& operator()(T&& x) const noexcept {
     return static_cast<T&&>(x);
   }
 };
+using Identity = identity_fn;
+FOLLY_INLINE_VARIABLE constexpr identity_fn identity;
 
 namespace moveonly_ { // Protection from unintended ADL.
 
@@ -330,6 +332,8 @@ class to_narrow_convertible {
           int> = 0>
   /* implicit */ constexpr operator Dst() const noexcept {
     FOLLY_PUSH_WARNING
+    FOLLY_MSVC_DISABLE_WARNING(4244) // lossy conversion: arguments
+    FOLLY_MSVC_DISABLE_WARNING(4267) // lossy conversion: variables
     FOLLY_GNU_DISABLE_WARNING("-Wconversion")
     return value_;
     FOLLY_POP_WARNING
@@ -362,5 +366,38 @@ constexpr std::underlying_type_t<E> to_underlying(E e) noexcept {
   static_assert(std::is_enum<E>::value, "not an enum type");
   return static_cast<std::underlying_type_t<E>>(e);
 }
+
+/*
+ * FOLLY_DECLVAL(T)
+ *
+ * This macro works like std::declval<T>() but does the same thing in a way
+ * that does not require instantiating a function template.
+ *
+ * Use this macro instead of std::declval<T>() in places that are widely
+ * instantiated to reduce compile-time overhead of instantiating function
+ * templates.
+ *
+ * Note that, like std::declval<T>(), this macro can only be used in
+ * unevaluated contexts.
+ *
+ * There are some small differences between this macro and std::declval<T>().
+ * - This macro results in a value of type 'T' instead of 'T&&'.
+ * - This macro requires the type T to be a complete type at the
+ *   point of use.
+ *   If this is a problem then use FOLLY_DECLVAL(T&&) instead, or if T might
+ *   be 'void', then use FOLLY_DECLVAL(std::add_rvalue_reference_t<T>).
+ */
+#if __cplusplus >= 201703L
+#define FOLLY_DECLVAL(...) static_cast<__VA_ARGS__ (*)() noexcept>(nullptr)()
+#else
+// Don't have noexcept-qualified function types prior to C++17
+// so just fall back to a function-template.
+namespace detail {
+template <typename T>
+T declval() noexcept;
+} // namespace detail
+
+#define FOLLY_DECLVAL(...) ::folly::detail::declval<__VA_ARGS__>()
+#endif
 
 } // namespace folly

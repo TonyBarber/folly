@@ -29,6 +29,7 @@
 #include <folly/Range.h>
 #include <folly/String.h>
 #include <folly/Unicode.h>
+#include <folly/Utility.h>
 #include <folly/lang/Bits.h>
 #include <folly/portability/Constexpr.h>
 
@@ -194,9 +195,7 @@ struct Printer {
     }
   }
 
-  void mapColon() const {
-    out_ += indentLevel_ ? ": " : ":";
-  }
+  void mapColon() const { out_ += indentLevel_ ? ": " : ":"; }
 
  private:
   std::string& out_;
@@ -216,13 +215,9 @@ struct Input {
   Input(Input const&) = delete;
   Input& operator=(Input const&) = delete;
 
-  char const* begin() const {
-    return range_.begin();
-  }
+  char const* begin() const { return range_.begin(); }
 
-  unsigned getLineNum() const {
-    return lineNum_;
-  }
+  unsigned getLineNum() const { return lineNum_; }
 
   // Parse ahead for as long as the supplied predicate is satisfied,
   // returning a range of what was skipped.
@@ -287,13 +282,9 @@ struct Input {
     ++*this;
   }
 
-  std::size_t size() const {
-    return range_.size();
-  }
+  std::size_t size() const { return range_.size(); }
 
-  int operator*() const {
-    return current_;
-  }
+  int operator*() const { return current_; }
 
   void operator++() {
     range_.pop_front();
@@ -326,9 +317,7 @@ struct Input {
     throw json::make_parse_error(lineNum_, context(), what);
   }
 
-  json::serialization_opts const& getOpts() {
-    return opts_;
-  }
+  json::serialization_opts const& getOpts() { return opts_; }
 
   void incrementRecursionLevel() {
     if (currentRecursionLevel_ > opts_.recursion_limit) {
@@ -337,14 +326,10 @@ struct Input {
     currentRecursionLevel_++;
   }
 
-  void decrementRecursionLevel() {
-    currentRecursionLevel_--;
-  }
+  void decrementRecursionLevel() { currentRecursionLevel_--; }
 
  private:
-  void storeCurrent() {
-    current_ = range_.empty() ? EOF : range_.front();
-  }
+  void storeCurrent() { current_ = range_.empty() ? EOF : range_.front(); }
 
  private:
   StringPiece range_;
@@ -360,9 +345,7 @@ class RecursionGuard {
     in_.incrementRecursionLevel();
   }
 
-  ~RecursionGuard() {
-    in_.decrementRecursionLevel();
-  }
+  ~RecursionGuard() { in_.decrementRecursionLevel(); }
 
  private:
   Input& in_;
@@ -557,24 +540,24 @@ std::string decodeUnicodeEscape(Input& in) {
     return ret;
   };
 
-  /*
-   * If the value encoded is in the surrogate pair range, we need to
-   * make sure there is another escape that we can use also.
-   */
-  uint32_t codePoint = readHex();
-  if (codePoint >= 0xd800 && codePoint <= 0xdbff) {
+  //  If the value encoded is in the surrogate pair range, we need to make
+  //  sure there is another escape that we can use also.
+  //
+  //  See the explanation in folly/Unicode.h.
+  uint16_t prefix = readHex();
+  char32_t codePoint = prefix;
+  if (utf16_code_unit_is_high_surrogate(prefix)) {
     if (!in.consume("\\u")) {
       in.error(
           "expected another unicode escape for second half of "
           "surrogate pair");
     }
-    uint16_t second = readHex();
-    if (second >= 0xdc00 && second <= 0xdfff) {
-      codePoint = 0x10000 + ((codePoint & 0x3ff) << 10) + (second & 0x3ff);
-    } else {
+    uint16_t suffix = readHex();
+    if (!utf16_code_unit_is_low_surrogate(suffix)) {
       in.error("second character in surrogate pair is invalid");
     }
-  } else if (codePoint >= 0xdc00 && codePoint <= 0xdfff) {
+    codePoint = unicode_code_point_from_utf16_surrogate_pair(prefix, suffix);
+  } else if (!utf16_code_unit_is_bmp(prefix)) {
     in.error("invalid unicode code point (in range [0xdc00,0xdfff])");
   }
 
@@ -758,7 +741,7 @@ void escapeStringImpl(
     // it literally into the output string.
     auto firstEsc = p;
     while (firstEsc < e) {
-      auto avail = e - firstEsc;
+      auto avail = to_unsigned(e - firstEsc);
       uint64_t word = 0;
       if (avail >= 8) {
         word = folly::loadUnaligned<uint64_t>(firstEsc);

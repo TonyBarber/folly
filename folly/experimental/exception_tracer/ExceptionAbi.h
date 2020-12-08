@@ -26,10 +26,12 @@
 
 namespace __cxxabiv1 {
 
+#if !defined(__FreeBSD__)
 struct __cxa_exception {
   std::type_info* exceptionType;
   void (*exceptionDestructor)(void*);
-  std::unexpected_handler unexpectedHandler;
+  void (*unexpectedHandler)(); // std::unexpected_handler has been removed from
+                               // C++17.
   std::terminate_handler terminateHandler;
   __cxa_exception* nextException;
 
@@ -52,5 +54,6 @@ extern "C" {
 __cxa_eh_globals* __cxa_get_globals(void) noexcept;
 __cxa_eh_globals* __cxa_get_globals_fast(void) noexcept;
 }
+#endif
 
 } // namespace __cxxabiv1

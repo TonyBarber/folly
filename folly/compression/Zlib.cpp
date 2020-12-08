@@ -244,11 +244,11 @@ ZlibStreamCodec::ZlibStreamCodec(Options options, int level)
 ZlibStreamCodec::~ZlibStreamCodec() {
   if (deflateStream_) {
     deflateEnd(deflateStream_.get_pointer());
-    deflateStream_.clear();
+    deflateStream_.reset();
   }
   if (inflateStream_) {
     inflateEnd(inflateStream_.get_pointer());
-    inflateStream_.clear();
+    inflateStream_.reset();
   }
 }
 
@@ -260,7 +260,7 @@ void ZlibStreamCodec::resetDeflateStream() {
   if (deflateStream_) {
     int const rc = deflateReset(deflateStream_.get_pointer());
     if (rc != Z_OK) {
-      deflateStream_.clear();
+      deflateStream_.reset();
       throw std::runtime_error(
           to<std::string>("ZlibStreamCodec: deflateReset error: ", rc));
     }
@@ -283,7 +283,7 @@ void ZlibStreamCodec::resetDeflateStream() {
       options_.memLevel,
       options_.strategy);
   if (rc != Z_OK) {
-    deflateStream_.clear();
+    deflateStream_.reset();
     throw std::runtime_error(
         to<std::string>("ZlibStreamCodec: deflateInit error: ", rc));
   }
@@ -293,7 +293,7 @@ void ZlibStreamCodec::resetInflateStream() {
   if (inflateStream_) {
     int const rc = inflateReset(inflateStream_.get_pointer());
     if (rc != Z_OK) {
-      inflateStream_.clear();
+      inflateStream_.reset();
       throw std::runtime_error(
           to<std::string>("ZlibStreamCodec: inflateReset error: ", rc));
     }
@@ -304,7 +304,7 @@ void ZlibStreamCodec::resetInflateStream() {
       inflateStream_.get_pointer(),
       getWindowBits(options_.format, options_.windowSize));
   if (rc != Z_OK) {
-    inflateStream_.clear();
+    inflateStream_.reset();
     throw std::runtime_error(
         to<std::string>("ZlibStreamCodec: inflateInit error: ", rc));
   }
@@ -342,7 +342,7 @@ bool ZlibStreamCodec::doCompressStream(
     resetDeflateStream();
     needReset_ = false;
   }
-  DCHECK(deflateStream_.hasValue());
+  DCHECK(deflateStream_.has_value());
   // zlib will return Z_STREAM_ERROR if output.data() is null.
   if (output.data() == nullptr) {
     return false;
@@ -377,7 +377,7 @@ bool ZlibStreamCodec::doUncompressStream(
     resetInflateStream();
     needReset_ = false;
   }
-  DCHECK(inflateStream_.hasValue());
+  DCHECK(inflateStream_.has_value());
   // zlib will return Z_STREAM_ERROR if output.data() is null.
   if (output.data() == nullptr) {
     return false;

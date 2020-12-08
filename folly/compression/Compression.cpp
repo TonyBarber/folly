@@ -560,9 +560,7 @@ class LZ4Codec final : public Codec {
   uint64_t doMaxUncompressedLength() const override;
   uint64_t doMaxCompressedLength(uint64_t uncompressedLength) const override;
 
-  bool encodeSize() const {
-    return type() == CodecType::LZ4_VARINT_SIZE;
-  }
+  bool encodeSize() const { return type() == CodecType::LZ4_VARINT_SIZE; }
 
   std::unique_ptr<IOBuf> doCompress(const IOBuf* data) override;
   std::unique_ptr<IOBuf> doUncompress(
@@ -700,7 +698,7 @@ std::unique_ptr<IOBuf> LZ4Codec::doUncompress(
     }
   } else {
     // Invariants
-    DCHECK(uncompressedLength.hasValue());
+    DCHECK(uncompressedLength.has_value());
     DCHECK(*uncompressedLength <= maxUncompressedLength());
     actualUncompressedLength = *uncompressedLength;
   }
@@ -1078,9 +1076,7 @@ class LZMA2StreamCodec final : public StreamCodec {
   uint64_t doMaxUncompressedLength() const override;
   uint64_t doMaxCompressedLength(uint64_t uncompressedLength) const override;
 
-  bool encodeSize() const {
-    return type() == CodecType::LZMA2_VARINT_SIZE;
-  }
+  bool encodeSize() const { return type() == CodecType::LZMA2_VARINT_SIZE; }
 
   void doResetStream() override;
   bool doCompressStream(
@@ -1171,11 +1167,11 @@ LZMA2StreamCodec::LZMA2StreamCodec(int level, CodecType type)
 LZMA2StreamCodec::~LZMA2StreamCodec() {
   if (cstream_) {
     lzma_end(cstream_.get_pointer());
-    cstream_.clear();
+    cstream_.reset();
   }
   if (dstream_) {
     lzma_end(dstream_.get_pointer());
-    dstream_.clear();
+    dstream_.reset();
   }
 }
 
@@ -1578,11 +1574,11 @@ int bzCheck(int const rc) {
 Bzip2StreamCodec::~Bzip2StreamCodec() {
   if (cstream_) {
     BZ2_bzCompressEnd(cstream_.get_pointer());
-    cstream_.clear();
+    cstream_.reset();
   }
   if (dstream_) {
     BZ2_bzDecompressEnd(dstream_.get_pointer());
-    dstream_.clear();
+    dstream_.reset();
   }
 }
 

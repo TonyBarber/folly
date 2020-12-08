@@ -299,9 +299,7 @@ class CursorBase {
     }
     return (crtPos == crtPosOther) && (crtBuf == crtBufOther);
   }
-  bool operator!=(const Derived& other) const {
-    return !operator==(other);
-  }
+  bool operator!=(const Derived& other) const { return !operator==(other); }
 
   template <class T>
   typename std::enable_if<std::is_arithmetic<T>::value, bool>::type tryRead(
@@ -635,9 +633,7 @@ class CursorBase {
 
   ~CursorBase() {}
 
-  BufType* head() {
-    return buffer_;
-  }
+  BufType* head() { return buffer_; }
 
   bool tryAdvanceBuffer() {
     BufType* nextBuf = crtBuf_->next();
@@ -695,13 +691,9 @@ class CursorBase {
   size_t remainingLen_{std::numeric_limits<size_t>::max()};
 
  private:
-  Derived& derived() {
-    return static_cast<Derived&>(*this);
-  }
+  Derived& derived() { return static_cast<Derived&>(*this); }
 
-  Derived const& derived() const {
-    return static_cast<const Derived&>(*this);
-  }
+  Derived const& derived() const { return static_cast<const Derived&>(*this); }
 
   template <class T>
   FOLLY_NOINLINE T readSlow() {
@@ -710,7 +702,7 @@ class CursorBase {
     return val;
   }
 
-  void readFixedStringSlow(std::string* str, size_t len) {
+  FOLLY_NOINLINE void readFixedStringSlow(std::string* str, size_t len) {
     for (size_t available; (available = length()) < len;) {
       str->append(reinterpret_cast<const char*>(data()), available);
       if (UNLIKELY(!tryAdvanceBuffer())) {
@@ -723,7 +715,7 @@ class CursorBase {
     advanceBufferIfEmpty();
   }
 
-  size_t pullAtMostSlow(void* buf, size_t len) {
+  FOLLY_NOINLINE size_t pullAtMostSlow(void* buf, size_t len) {
     // If the length of this buffer is 0 try advancing it.
     // Otherwise on the first iteration of the following loop memcpy is called
     // with a null source pointer.
@@ -747,13 +739,13 @@ class CursorBase {
     return copied + len;
   }
 
-  void pullSlow(void* buf, size_t len) {
+  FOLLY_NOINLINE void pullSlow(void* buf, size_t len) {
     if (UNLIKELY(pullAtMostSlow(buf, len) != len)) {
       throw_exception<std::out_of_range>("underflow");
     }
   }
 
-  size_t skipAtMostSlow(size_t len) {
+  FOLLY_NOINLINE size_t skipAtMostSlow(size_t len) {
     size_t skipped = 0;
     for (size_t available; (available = length()) < len;) {
       skipped += available;
@@ -767,13 +759,13 @@ class CursorBase {
     return skipped + len;
   }
 
-  void skipSlow(size_t len) {
+  FOLLY_NOINLINE void skipSlow(size_t len) {
     if (UNLIKELY(skipAtMostSlow(len) != len)) {
       throw_exception<std::out_of_range>("underflow");
     }
   }
 
-  size_t retreatAtMostSlow(size_t len) {
+  FOLLY_NOINLINE size_t retreatAtMostSlow(size_t len) {
     size_t retreated = 0;
     for (size_t available; (available = crtPos_ - crtBegin_) < len;) {
       retreated += available;
@@ -786,7 +778,7 @@ class CursorBase {
     return retreated + len;
   }
 
-  void retreatSlow(size_t len) {
+  FOLLY_NOINLINE void retreatSlow(size_t len) {
     if (UNLIKELY(retreatAtMostSlow(len) != len)) {
       throw_exception<std::out_of_range>("underflow");
     }
@@ -1037,9 +1029,7 @@ class RWCursor : public detail::CursorBase<RWCursor<access>, IOBuf>,
     }
   }
 
-  void advanceDone() {
-    maybeShared_ = true;
-  }
+  void advanceDone() { maybeShared_ = true; }
 
   bool maybeShared_;
 };
@@ -1060,21 +1050,15 @@ class Appender : public detail::Writable<Appender> {
   Appender(IOBuf* buf, std::size_t growth)
       : buffer_(buf), crtBuf_(buf->prev()), growth_(growth) {}
 
-  uint8_t* writableData() {
-    return crtBuf_->writableTail();
-  }
+  uint8_t* writableData() { return crtBuf_->writableTail(); }
 
-  size_t length() const {
-    return crtBuf_->tailroom();
-  }
+  size_t length() const { return crtBuf_->tailroom(); }
 
   /**
    * Mark n bytes (must be <= length()) as appended, as per the
    * IOBuf::append() method.
    */
-  void append(size_t n) {
-    crtBuf_->append(n);
-  }
+  void append(size_t n) { crtBuf_->append(n); }
 
   /**
    * Ensure at least n contiguous bytes available to write.
@@ -1166,9 +1150,7 @@ class Appender : public detail::Writable<Appender> {
    * piece.  This allows Appender objects to be used directly with
    * Formatter.
    */
-  void operator()(StringPiece sp) {
-    push(ByteRange(sp));
-  }
+  void operator()(StringPiece sp) { push(ByteRange(sp)); }
 
  private:
   bool tryGrowChain() {
@@ -1202,17 +1184,11 @@ class QueueAppender : public detail::Writable<QueueAppender> {
     growth_ = growth;
   }
 
-  uint8_t* writableData() {
-    return queueCache_.writableData();
-  }
+  uint8_t* writableData() { return queueCache_.writableData(); }
 
-  size_t length() {
-    return queueCache_.length();
-  }
+  size_t length() { return queueCache_.length(); }
 
-  void append(size_t n) {
-    queueCache_.append(n);
-  }
+  void append(size_t n) { queueCache_.append(n); }
 
   // Ensure at least n contiguous; can go above growth_, throws if
   // not enough room.
